@@ -37,6 +37,8 @@ export type DeferredStreamingFinalization = {
   billHedgeLosers?: boolean;
   /** Exact pending-rebind target; only full-response finalization may clear/reset its streak. */
   priorityUpgradeRebindTargetProviderId?: number;
+  /** Resolves true only when the sticky Redis binding was actually committed. */
+  priorityUpgradeRebindBindingPromise?: Promise<boolean>;
 };
 
 const deferredMeta = new WeakMap<ProxySession, DeferredStreamingFinalization>();

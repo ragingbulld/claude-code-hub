@@ -761,6 +761,7 @@ describe("ProxyResponseHandler stream client abort finalization", () => {
       endpointUrl: "https://api.test.invalid/v1",
       upstreamStatusCode: 200,
       priorityUpgradeRebindTargetProviderId: 1,
+      priorityUpgradeRebindBindingPromise: Promise.resolve(true),
     });
 
     await ProxyResponseHandler.dispatch(session, createResponsesSse());
@@ -778,6 +779,35 @@ describe("ProxyResponseHandler stream client abort finalization", () => {
     );
     expect(priorityUpgradeMocks.finalizeSuccess).toHaveBeenCalledWith("session_rebind_complete", 1);
     expect(priorityUpgradeMocks.finalizeFailure).not.toHaveBeenCalled();
+  });
+
+  it("treats a complete target response as rebind failure when sticky binding did not commit", async () => {
+    const controller = new AbortController();
+    const session = createSession(controller.signal);
+    session.sessionId = "session_rebind_binding_failed";
+    setDeferredStreamingFinalization(session, {
+      providerId: 1,
+      providerName: "avemujica-responses",
+      providerPriority: 1,
+      attemptNumber: 1,
+      totalProvidersAttempted: 1,
+      isFirstAttempt: true,
+      isFailoverSuccess: false,
+      endpointId: 42,
+      endpointUrl: "https://api.test.invalid/v1",
+      upstreamStatusCode: 200,
+      priorityUpgradeRebindTargetProviderId: 1,
+      priorityUpgradeRebindBindingPromise: Promise.resolve(false),
+    });
+
+    await ProxyResponseHandler.dispatch(session, createResponsesSse());
+    await drainAsyncTasks();
+
+    expect(priorityUpgradeMocks.finalizeFailure).toHaveBeenCalledWith(
+      "session_rebind_binding_failed",
+      1
+    );
+    expect(priorityUpgradeMocks.finalizeSuccess).not.toHaveBeenCalled();
   });
 
   it("keeps stream accounting bounded for oversized successful streams", async () => {
@@ -949,6 +979,7 @@ describe("ProxyResponseHandler stream client abort finalization", () => {
       endpointUrl: "https://api.test.invalid/v1",
       upstreamStatusCode: 200,
       priorityUpgradeRebindTargetProviderId: 1,
+      priorityUpgradeRebindBindingPromise: Promise.resolve(true),
     });
 
     await ProxyResponseHandler.dispatch(session, createErroredResponsesSse());

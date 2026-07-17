@@ -905,6 +905,7 @@ async function finalizeDeferredStreamingFinalizationIfNeeded(
       meta?.priorityUpgradeRebindTargetProviderId != null &&
       meta.priorityUpgradeRebindTargetProviderId === meta.providerId
     ) {
+      await meta.priorityUpgradeRebindBindingPromise?.catch(() => false);
       await finalizePriorityUpgradeRebindFailure(
         session.sessionId,
         meta.priorityUpgradeRebindTargetProviderId
@@ -1221,10 +1222,17 @@ async function finalizeDeferredStreamingFinalizationIfNeeded(
     meta.priorityUpgradeRebindTargetProviderId != null &&
     meta.priorityUpgradeRebindTargetProviderId === meta.providerId
   ) {
-    await finalizePriorityUpgradeRebindSuccess(
-      session.sessionId,
-      meta.priorityUpgradeRebindTargetProviderId
-    );
+    const bindingCommitted =
+      (await meta.priorityUpgradeRebindBindingPromise?.catch(() => false)) === true;
+    await (bindingCommitted
+      ? finalizePriorityUpgradeRebindSuccess(
+          session.sessionId,
+          meta.priorityUpgradeRebindTargetProviderId
+        )
+      : finalizePriorityUpgradeRebindFailure(
+          session.sessionId,
+          meta.priorityUpgradeRebindTargetProviderId
+        ));
   }
 
   if (meta.endpointId != null) {
@@ -4399,7 +4407,10 @@ export async function finalizeRequestStats(
     deferredMeta?.priorityUpgradeRebindTargetProviderId != null &&
     deferredMeta.priorityUpgradeRebindTargetProviderId === deferredMeta.providerId
   ) {
-    const rebindSucceeded = statusCode >= 200 && statusCode < 300 && !errorMessage;
+    const bindingCommitted =
+      (await deferredMeta.priorityUpgradeRebindBindingPromise?.catch(() => false)) === true;
+    const rebindSucceeded =
+      statusCode >= 200 && statusCode < 300 && !errorMessage && bindingCommitted;
     await (rebindSucceeded
       ? finalizePriorityUpgradeRebindSuccess(
           session.sessionId,

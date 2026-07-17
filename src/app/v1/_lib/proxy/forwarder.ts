@@ -4752,8 +4752,9 @@ export class ProxyForwarder {
 
       abortAllAttempts(attempt, "hedge_loser");
 
+      let priorityUpgradeRebindBindingPromise: Promise<boolean> | undefined;
       if (session.sessionId) {
-        void (async () => {
+        const bindingTask = (async (): Promise<boolean> => {
           const plan = session.getPriorityUpgradePlan();
           // Only a real provider switch (or an explicit pending rebind) may force
           // the sticky binding and reset its timeout streak. If the original sticky
@@ -4787,11 +4788,22 @@ export class ProxyForwarder {
               providerName: attempt.provider.name,
             });
           }
+          return bindingResult.updated;
         })().catch((bindingError) => {
           logger.error("ProxyForwarder: Failed to update session provider info for hedge winner", {
             error: bindingError,
           });
+          return false;
         });
+
+        if (
+          upgradePlan?.mode === "apply_pending_rebind" &&
+          attempt.provider.id === upgradePlan.higherPriorityProviderId
+        ) {
+          priorityUpgradeRebindBindingPromise = bindingTask;
+        } else {
+          void bindingTask;
+        }
       }
 
       setDeferredStreamingFinalization(session, {
@@ -4812,6 +4824,7 @@ export class ProxyForwarder {
           attempt.provider.id === upgradePlan.higherPriorityProviderId
             ? upgradePlan.higherPriorityProviderId
             : undefined,
+        priorityUpgradeRebindBindingPromise,
       });
 
       const response = new Response(

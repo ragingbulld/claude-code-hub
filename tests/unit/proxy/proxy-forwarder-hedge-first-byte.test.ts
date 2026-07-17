@@ -166,6 +166,7 @@ import {
 import { ProxyForwarder } from "@/app/v1/_lib/proxy/forwarder";
 import { ModelRedirector } from "@/app/v1/_lib/proxy/model-redirector";
 import { ProxySession } from "@/app/v1/_lib/proxy/session";
+import { peekDeferredStreamingFinalization } from "@/app/v1/_lib/proxy/stream-finalization";
 import { logger } from "@/lib/logger";
 import type { Provider } from "@/types/provider";
 
@@ -1619,6 +1620,37 @@ describe("ProxyForwarder - first-byte hedge scheduling", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  test("a complete pending target keeps rebind finalization gated on the binding result", async () => {
+    const target = createProvider({ id: 60, name: "pending-target-complete", priority: 0 });
+    const session = createSession();
+    session.setProvider(target);
+    session.setPriorityUpgradePlan({
+      mode: "apply_pending_rebind",
+      stickyProviderId: 59,
+      higherPriorityProviderId: target.id,
+      higherPriorityProviderIds: [target.id],
+      probeEpoch: 7,
+      stickyPriority: 1,
+      higherPriority: 0,
+    });
+    mocks.updateSessionBindingSmart.mockResolvedValueOnce({
+      updated: false,
+      reason: "binding_not_updated",
+    });
+    vi.spyOn(
+      ProxyForwarder as unknown as {
+        doForward: (...args: unknown[]) => Promise<Response>;
+      },
+      "doForward"
+    ).mockResolvedValueOnce(new Response("ok", { status: 200 }));
+
+    const response = await ProxyForwarder.send(session);
+    expect(await response.text()).toBe("ok");
+    const meta = peekDeferredStreamingFinalization(session);
+    expect(meta?.priorityUpgradeRebindTargetProviderId).toBe(target.id);
+    await expect(meta?.priorityUpgradeRebindBindingPromise).resolves.toBe(false);
   });
 
   test("a pending rebind target failure before first byte resets its three-pass streak", async () => {
