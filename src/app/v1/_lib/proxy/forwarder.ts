@@ -24,12 +24,14 @@ import { recordEndpointFailure, recordEndpointSuccess } from "@/lib/endpoint-cir
 import { applyGeminiGoogleSearchOverrideWithAudit } from "@/lib/gemini/provider-overrides";
 import { logger } from "@/lib/logger";
 import {
+  createPriorityUpgradeProbeBatches,
   isPriorityUpgradeFirstByteSlaMet,
   PRIORITY_UPGRADE_PROBE,
   refreshSessionProbeRoundLock,
   releaseProbeInflightSlot,
   releaseProviderProbeLock,
   releaseSessionProbeRoundLock,
+  selectPriorityUpgradeProbeWinner,
   setPendingPriorityRebindIfEpoch,
   tryAcquireProbeInflightSlot,
   tryAcquireProviderProbeLock,
@@ -4966,187 +4968,160 @@ export class ProxyForwarder {
     };
 
     const model = session.getCurrentModel() || session.getOriginalModel() || undefined;
-    const priorities = [...new Set(providers.map((provider) => provider.priority || 0))].sort(
-      (a, b) => a - b
-    );
+    const batches = createPriorityUpgradeProbeBatches(providers);
 
-    for (const priority of priorities) {
-      const tier = providers.filter((provider) => (provider.priority || 0) === priority);
+    // Fill each bounded batch from the complete priority/weight-ordered plan.
+    // Lower-priority probes may run early to use spare slots, but can never win
+    // until every higher-priority candidate in the same batch has completed.
+    for (const batch of batches) {
+      if (!(await isProbeCurrent())) return;
 
-      // Test one bounded batch at a time. A whole priority tier must fail before
-      // moving toward the current (more expensive) sticky provider.
-      for (
-        let offset = 0;
-        offset < tier.length;
-        offset += PRIORITY_UPGRADE_PROBE.GLOBAL_INFLIGHT_LIMIT
-      ) {
-        if (!(await isProbeCurrent())) return;
+      const outcomes = await Promise.all(
+        batch.map(async (provider) => {
+          const providerLockToken = await tryAcquireProviderProbeLock(provider.id);
+          if (!providerLockToken) return { provider, state: "deferred" as const };
 
-        const batch = tier.slice(offset, offset + PRIORITY_UPGRADE_PROBE.GLOBAL_INFLIGHT_LIMIT);
-        const outcomes = await Promise.all(
-          batch.map(async (provider) => {
-            const providerLockToken = await tryAcquireProviderProbeLock(provider.id);
-            if (!providerLockToken) return { provider, state: "deferred" as const };
+          const inflightToken = await tryAcquireProbeInflightSlot();
+          if (!inflightToken) {
+            await releaseProviderProbeLock(provider.id, providerLockToken);
+            return { provider, state: "deferred" as const };
+          }
 
-            const inflightToken = await tryAcquireProbeInflightSlot();
-            if (!inflightToken) {
-              await releaseProviderProbeLock(provider.id, providerLockToken);
-              return { provider, state: "deferred" as const };
-            }
+          session.addProviderToChain(provider, {
+            reason: "priority_upgrade_probe",
+            selectionMethod: "priority_upgrade",
+            circuitState: getCircuitState(provider.id),
+            errorMessage: "cheap_test_start",
+          });
+          await persistProbeChain();
 
-            session.addProviderToChain(provider, {
-              reason: "priority_upgrade_probe",
-              selectionMethod: "priority_upgrade",
-              circuitState: getCircuitState(provider.id),
-              errorMessage: "cheap_test_start",
+          const timeoutMs =
+            provider.firstByteTimeoutStreamingMs > 0
+              ? provider.firstByteTimeoutStreamingMs
+              : PRIORITY_UPGRADE_PROBE.DEFAULT_TIMEOUT_MS;
+          const totalTimeoutMs = Math.min(
+            PRIORITY_UPGRADE_PROBE.PROVIDER_LOCK_MS - 5_000,
+            timeoutMs + 30_000
+          );
+
+          try {
+            const result = await executeProviderTest({
+              providerId: String(provider.id),
+              providerUrl: provider.url,
+              apiKey: provider.key,
+              providerType: provider.providerType,
+              model: model || undefined,
+              proxyUrl: provider.proxyUrl ?? undefined,
+              proxyFallbackToDirect: provider.proxyFallbackToDirect,
+              customHeaders: provider.customHeaders ?? undefined,
+              timeoutMs: totalTimeoutMs,
+              firstByteTimeoutMs: timeoutMs,
+              latencyThresholdMs: timeoutMs,
             });
-            await persistProbeChain();
+            return {
+              provider,
+              providerLockToken,
+              state: "completed" as const,
+              result,
+              timeoutMs,
+            };
+          } catch (error) {
+            return {
+              provider,
+              providerLockToken,
+              state: "errored" as const,
+              error,
+              timeoutMs,
+            };
+          } finally {
+            await releaseProbeInflightSlot(inflightToken);
+          }
+        })
+      );
 
-            const timeoutMs =
-              provider.firstByteTimeoutStreamingMs > 0
-                ? provider.firstByteTimeoutStreamingMs
-                : PRIORITY_UPGRADE_PROBE.DEFAULT_TIMEOUT_MS;
-            const totalTimeoutMs = Math.min(
-              PRIORITY_UPGRADE_PROBE.PROVIDER_LOCK_MS - 5_000,
-              timeoutMs + 30_000
-            );
+      if (!(await isProbeCurrent())) {
+        for (const outcome of outcomes) {
+          if (outcome.state === "completed" || outcome.state === "errored") {
+            await releaseProviderProbeLock(outcome.provider.id, outcome.providerLockToken);
+          }
+        }
+        for (const outcome of outcomes) {
+          if (outcome.state !== "completed" && outcome.state !== "errored") continue;
+          session.addProviderToChain(outcome.provider, {
+            reason: "priority_upgrade_probe",
+            selectionMethod: "priority_upgrade",
+            circuitState: getCircuitState(outcome.provider.id),
+            errorMessage: "cheap_test_discarded_hedge_race",
+          });
+        }
+        await persistProbeChain();
+        return;
+      }
 
-            try {
-              const result = await executeProviderTest({
-                providerId: String(provider.id),
-                providerUrl: provider.url,
-                apiKey: provider.key,
-                providerType: provider.providerType,
-                model: model || undefined,
-                proxyUrl: provider.proxyUrl ?? undefined,
-                proxyFallbackToDirect: provider.proxyFallbackToDirect,
-                customHeaders: provider.customHeaders ?? undefined,
-                timeoutMs: totalTimeoutMs,
-                firstByteTimeoutMs: timeoutMs,
-                latencyThresholdMs: timeoutMs,
-              });
-              return {
-                provider,
-                providerLockToken,
-                state: "completed" as const,
-                result,
-                timeoutMs,
-              };
-            } catch (error) {
-              return {
-                provider,
-                providerLockToken,
-                state: "errored" as const,
-                error,
-                timeoutMs,
-              };
-            } finally {
-              await releaseProbeInflightSlot(inflightToken);
-            }
-          })
+      const passed: Array<{
+        provider: Provider;
+        providerLockToken: string;
+        firstByteMs: number;
+      }> = [];
+      const deferredProviders: Provider[] = [];
+
+      for (const outcome of outcomes) {
+        if (outcome.state === "deferred") {
+          deferredProviders.push(outcome.provider);
+          continue;
+        }
+
+        if (outcome.state === "errored") {
+          await releaseProviderProbeLock(outcome.provider.id, outcome.providerLockToken);
+          session.addProviderToChain(outcome.provider, {
+            reason: "priority_upgrade_probe",
+            selectionMethod: "priority_upgrade",
+            circuitState: getCircuitState(outcome.provider.id),
+            errorMessage: "cheap_test_error",
+          });
+          await persistProbeChain();
+          logger.debug("ProxyForwarder: priority-upgrade cheap test failed", {
+            providerId: outcome.provider.id,
+            error: outcome.error instanceof Error ? outcome.error.message : String(outcome.error),
+            sessionId: session.sessionId ?? null,
+          });
+          continue;
+        }
+
+        const result = outcome.result;
+        const withinSla = isPriorityUpgradeFirstByteSlaMet(result, outcome.timeoutMs);
+        const firstByteMs = result.firstByteMs;
+
+        if (withinSla && firstByteMs !== undefined) {
+          passed.push({
+            provider: outcome.provider,
+            providerLockToken: outcome.providerLockToken,
+            firstByteMs,
+          });
+        } else {
+          await releaseProviderProbeLock(outcome.provider.id, outcome.providerLockToken);
+          session.addProviderToChain(outcome.provider, {
+            reason: "priority_upgrade_probe",
+            selectionMethod: "priority_upgrade",
+            circuitState: getCircuitState(outcome.provider.id),
+            errorMessage: `cheap_test_fail_status=${result.status}_first_byte_ms=${firstByteMs ?? -1}`,
+          });
+          await persistProbeChain();
+        }
+      }
+
+      if (passed.length > 0) {
+        const winner = selectPriorityUpgradeProbeWinner(passed)!;
+        const winnerPriority = winner.provider.priority || 0;
+        const deferredHigherPriority = deferredProviders.some(
+          (provider) => (provider.priority || 0) < winnerPriority
         );
 
-        if (!(await isProbeCurrent())) {
-          for (const outcome of outcomes) {
-            if (outcome.state === "completed" || outcome.state === "errored") {
-              await releaseProviderProbeLock(outcome.provider.id, outcome.providerLockToken);
-            }
-          }
-          for (const outcome of outcomes) {
-            if (outcome.state !== "completed" && outcome.state !== "errored") continue;
-            session.addProviderToChain(outcome.provider, {
-              reason: "priority_upgrade_probe",
-              selectionMethod: "priority_upgrade",
-              circuitState: getCircuitState(outcome.provider.id),
-              errorMessage: "cheap_test_discarded_hedge_race",
-            });
-          }
-          await persistProbeChain();
-          return;
-        }
-
-        const passed: Array<{
-          provider: Provider;
-          providerLockToken: string;
-          firstByteMs: number;
-        }> = [];
-        let deferred = false;
-
-        for (const outcome of outcomes) {
-          if (outcome.state === "deferred") {
-            deferred = true;
-            continue;
-          }
-
-          if (outcome.state === "errored") {
-            await releaseProviderProbeLock(outcome.provider.id, outcome.providerLockToken);
-            session.addProviderToChain(outcome.provider, {
-              reason: "priority_upgrade_probe",
-              selectionMethod: "priority_upgrade",
-              circuitState: getCircuitState(outcome.provider.id),
-              errorMessage: "cheap_test_error",
-            });
-            await persistProbeChain();
-            logger.debug("ProxyForwarder: priority-upgrade cheap test failed", {
-              providerId: outcome.provider.id,
-              error: outcome.error instanceof Error ? outcome.error.message : String(outcome.error),
-              sessionId: session.sessionId ?? null,
-            });
-            continue;
-          }
-
-          const result = outcome.result;
-          const withinSla = isPriorityUpgradeFirstByteSlaMet(result, outcome.timeoutMs);
-          const firstByteMs = result.firstByteMs;
-
-          if (withinSla && firstByteMs !== undefined) {
-            passed.push({
-              provider: outcome.provider,
-              providerLockToken: outcome.providerLockToken,
-              firstByteMs,
-            });
-          } else {
-            await releaseProviderProbeLock(outcome.provider.id, outcome.providerLockToken);
-            session.addProviderToChain(outcome.provider, {
-              reason: "priority_upgrade_probe",
-              selectionMethod: "priority_upgrade",
-              circuitState: getCircuitState(outcome.provider.id),
-              errorMessage: `cheap_test_fail_status=${result.status}_first_byte_ms=${firstByteMs ?? -1}`,
-            });
-            await persistProbeChain();
-          }
-        }
-
-        if (passed.length > 0) {
-          passed.sort((a, b) => a.firstByteMs - b.firstByteMs);
-          const winner = passed[0];
-          const published = session.sessionId
-            ? await setPendingPriorityRebindIfEpoch(
-                session.sessionId,
-                winner.provider.id,
-                probeEpoch
-              )
-            : false;
-
+        // Never promote a lower-priority pass while an untested higher-priority
+        // candidate in this batch is still protected by another probe/global slot.
+        if (deferredHigherPriority) {
           for (const candidate of passed) {
             await releaseProviderProbeLock(candidate.provider.id, candidate.providerLockToken);
-          }
-
-          if (!published) {
-            for (const candidate of passed) {
-              session.addProviderToChain(candidate.provider, {
-                reason: "priority_upgrade_probe",
-                selectionMethod: "priority_upgrade",
-                circuitState: getCircuitState(candidate.provider.id),
-                errorMessage: "cheap_test_discarded_hedge_race",
-              });
-            }
-            await persistProbeChain();
-            return;
-          }
-
-          for (const candidate of passed) {
-            if (candidate.provider.id === winner.provider.id) continue;
             session.addProviderToChain(candidate.provider, {
               reason: "priority_upgrade_probe",
               selectionMethod: "priority_upgrade",
@@ -5154,22 +5129,54 @@ export class ProxyForwarder {
               errorMessage: `cheap_test_ok_not_selected_first_byte_ms=${candidate.firstByteMs}`,
             });
           }
-
-          session.addProviderToChain(winner.provider, {
-            reason: "priority_upgrade_probe",
-            selectionMethod: "priority_upgrade",
-            circuitState: getCircuitState(winner.provider.id),
-            errorMessage: `cheap_test_ok_pending_rebind_first_byte_ms=${winner.firstByteMs}`,
-          });
           await persistProbeChain();
           return;
         }
 
-        // A busy global/provider lock means part of this priority tier was not
-        // actually tested. Wait for a later healthy request instead of skipping
-        // to a lower-priority (more expensive) tier.
-        if (deferred) return;
+        const published = session.sessionId
+          ? await setPendingPriorityRebindIfEpoch(session.sessionId, winner.provider.id, probeEpoch)
+          : false;
+
+        for (const candidate of passed) {
+          await releaseProviderProbeLock(candidate.provider.id, candidate.providerLockToken);
+        }
+
+        if (!published) {
+          for (const candidate of passed) {
+            session.addProviderToChain(candidate.provider, {
+              reason: "priority_upgrade_probe",
+              selectionMethod: "priority_upgrade",
+              circuitState: getCircuitState(candidate.provider.id),
+              errorMessage: "cheap_test_discarded_hedge_race",
+            });
+          }
+          await persistProbeChain();
+          return;
+        }
+
+        for (const candidate of passed) {
+          if (candidate.provider.id === winner.provider.id) continue;
+          session.addProviderToChain(candidate.provider, {
+            reason: "priority_upgrade_probe",
+            selectionMethod: "priority_upgrade",
+            circuitState: getCircuitState(candidate.provider.id),
+            errorMessage: `cheap_test_ok_not_selected_first_byte_ms=${candidate.firstByteMs}`,
+          });
+        }
+
+        session.addProviderToChain(winner.provider, {
+          reason: "priority_upgrade_probe",
+          selectionMethod: "priority_upgrade",
+          circuitState: getCircuitState(winner.provider.id),
+          errorMessage: `cheap_test_ok_pending_rebind_first_byte_ms=${winner.firstByteMs}`,
+        });
+        await persistProbeChain();
+        return;
       }
+
+      // A busy provider/global lock means an ordered candidate was not tested.
+      // Do not advance farther down the plan on this round.
+      if (deferredProviders.length > 0) return;
     }
   }
 

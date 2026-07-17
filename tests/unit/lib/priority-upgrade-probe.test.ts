@@ -61,12 +61,14 @@ vi.mock("@/lib/logger", () => ({
 import {
   PRIORITY_UPGRADE_PROBE,
   consumePendingPriorityRebind,
+  createPriorityUpgradeProbeBatches,
   getPendingPriorityRebind,
   isPriorityUpgradeFirstByteSlaMet,
   isPriorityUpgradeProbeEnabled,
   refreshSessionProbeRoundLock,
   releaseProviderProbeLock,
   releaseSessionProbeRoundLock,
+  selectPriorityUpgradeProbeWinner,
   setPendingPriorityRebindIfEpoch,
   tryAcquireProviderProbeLock,
   tryAcquireSessionProbeGate,
@@ -86,6 +88,28 @@ describe("priority-upgrade probe", () => {
     expect(PRIORITY_UPGRADE_PROBE.GLOBAL_INFLIGHT_LIMIT).toBe(3);
     expect(PRIORITY_UPGRADE_PROBE.SESSION_ROUND_LOCK_MS).toBe(210_000);
     expect(PRIORITY_UPGRADE_PROBE.SESSION_ROUND_LOCK_REFRESH_MS).toBe(60_000);
+  });
+
+  it("fills a probe batch across priority boundaries", () => {
+    const p1 = { id: 1, priority: 1 };
+    const p2a = { id: 2, priority: 2 };
+    const p2b = { id: 3, priority: 2 };
+    const p2c = { id: 4, priority: 2 };
+
+    expect(createPriorityUpgradeProbeBatches([p1, p2a, p2b, p2c])).toEqual([[p1, p2a, p2b], [p2c]]);
+  });
+
+  it("chooses priority before first-byte speed in a mixed batch", () => {
+    const p1SlowPass = { provider: { id: 1, priority: 1 }, firstByteMs: 900 };
+    const p2FastPass = { provider: { id: 2, priority: 2 }, firstByteMs: 100 };
+    const p2SlowPass = { provider: { id: 3, priority: 2 }, firstByteMs: 300 };
+
+    expect(
+      selectPriorityUpgradeProbeWinner([p2FastPass, p1SlowPass, p2SlowPass])?.provider.id
+    ).toBe(p1SlowPass.provider.id);
+    expect(selectPriorityUpgradeProbeWinner([p2SlowPass, p2FastPass])?.provider.id).toBe(
+      p2FastPass.provider.id
+    );
   });
 
   it("allows one complete probe round per session interval", async () => {

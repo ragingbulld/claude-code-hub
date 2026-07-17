@@ -2,7 +2,7 @@
  * Priority-upgrade probe state (cheap test gate + pending rebind).
  *
  * Goal: when sticky is on a lower-priority (often more expensive) provider,
- * cheap-test higher-priority candidates in round-robin. If the cheap test
+ * cheap-test higher-priority candidates in priority/weight order. If the cheap test
  * passes, the NEXT request rebinds directly to that higher-priority provider
  * (single-send, no parallel race with the old sticky).
  */
@@ -58,6 +58,45 @@ export function isPriorityUpgradeFirstByteSlaMet(
   return (
     result.success && typeof result.firstByteMs === "number" && result.firstByteMs <= timeoutMs
   );
+}
+
+/** Fill bounded probe batches from the already priority/weight-ordered candidate list. */
+export function createPriorityUpgradeProbeBatches<T>(
+  candidates: readonly T[],
+  batchSize = PRIORITY_UPGRADE_PROBE.GLOBAL_INFLIGHT_LIMIT
+): T[][] {
+  const size = Math.max(1, Math.floor(batchSize));
+  const batches: T[][] = [];
+  for (let offset = 0; offset < candidates.length; offset += size) {
+    batches.push(candidates.slice(offset, offset + size));
+  }
+  return batches;
+}
+
+/**
+ * A completed mixed-priority batch may contain faster lower-priority passes.
+ * Priority wins first; first-byte speed only breaks ties inside that tier.
+ */
+export function selectPriorityUpgradeProbeWinner<
+  T extends { provider: { priority?: number | null }; firstByteMs: number },
+>(passed: readonly T[]): T | null {
+  let winner: T | null = null;
+  for (const candidate of passed) {
+    if (!winner) {
+      winner = candidate;
+      continue;
+    }
+
+    const candidatePriority = candidate.provider.priority || 0;
+    const winnerPriority = winner.provider.priority || 0;
+    if (
+      candidatePriority < winnerPriority ||
+      (candidatePriority === winnerPriority && candidate.firstByteMs < winner.firstByteMs)
+    ) {
+      winner = candidate;
+    }
+  }
+  return winner;
 }
 
 /**
