@@ -5,6 +5,7 @@ import { logger } from "@/lib/logger";
 import {
   consumePendingPriorityRebind,
   isPriorityUpgradeProbeEnabled,
+  preparePriorityUpgradeProbeContext,
 } from "@/lib/priority-upgrade-probe";
 import { RateLimitService } from "@/lib/rate-limit";
 import { SessionManager } from "@/lib/session-manager";
@@ -839,6 +840,15 @@ export class ProxyProviderResolver {
     const allProviders = await session.getProvidersSnapshot();
     const effectiveGroup = getEffectiveProviderGroup(session);
     const stickyPriority = ProxyProviderResolver.resolveEffectivePriority(sticky, effectiveGroup);
+    const probeContext = JSON.stringify([
+      requestedModel,
+      session.originalFormat ?? "",
+      effectiveGroup ?? "",
+      sticky.id,
+    ]);
+    if (!(await preparePriorityUpgradeProbeContext(session.sessionId, probeContext))) {
+      return null;
+    }
 
     const passesRequestPolicy = (provider: Provider): boolean => {
       if (!provider.isEnabled || provider.id === sticky.id || provider.disableSessionReuse) {

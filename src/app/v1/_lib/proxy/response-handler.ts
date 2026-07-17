@@ -9,6 +9,10 @@ import { getCachedSystemSettings } from "@/lib/config/system-settings-cache";
 import { emitProxyLangfuseTrace } from "@/lib/langfuse/emit-proxy-trace";
 import { logger } from "@/lib/logger";
 import { requestCloudPriceTableSync } from "@/lib/price-sync/cloud-price-updater";
+import {
+  finalizePriorityUpgradeRebindFailure,
+  finalizePriorityUpgradeRebindSuccess,
+} from "@/lib/priority-upgrade-probe";
 import { ProxyStatusTracker } from "@/lib/proxy-status-tracker";
 import { RateLimitService } from "@/lib/rate-limit";
 import { deleteLiveChain } from "@/lib/redis/live-chain-store";
@@ -897,6 +901,15 @@ async function finalizeDeferredStreamingFinalizationIfNeeded(
   const provider = session.provider;
   const clearSessionBinding = async () => {
     if (!session.sessionId) return;
+    if (
+      meta?.priorityUpgradeRebindTargetProviderId != null &&
+      meta.priorityUpgradeRebindTargetProviderId === meta.providerId
+    ) {
+      await finalizePriorityUpgradeRebindFailure(
+        session.sessionId,
+        meta.priorityUpgradeRebindTargetProviderId
+      );
+    }
     await SessionManager.clearSessionProvider(session.sessionId);
   };
 
@@ -1203,6 +1216,17 @@ async function finalizeDeferredStreamingFinalizationIfNeeded(
   }
 
   // ========== 真正成功（SSE 完整结束且未命中错误判定）==========
+  if (
+    session.sessionId &&
+    meta.priorityUpgradeRebindTargetProviderId != null &&
+    meta.priorityUpgradeRebindTargetProviderId === meta.providerId
+  ) {
+    await finalizePriorityUpgradeRebindSuccess(
+      session.sessionId,
+      meta.priorityUpgradeRebindTargetProviderId
+    );
+  }
+
   if (meta.endpointId != null) {
     try {
       const { recordEndpointSuccess } = await import("@/lib/endpoint-circuit-breaker");
@@ -4368,7 +4392,25 @@ export async function finalizeRequestStats(
   // finalizeStream. Peek the deferred meta (without consuming it — commitWinner already did
   // the binding/chain) so the winner cost write uses the loser-sum-aware mode and does not
   // clobber concurrently-billed loser increments.
-  const winnerLoserAware = peekDeferredStreamingFinalization(session)?.billHedgeLosers === true;
+  const deferredMeta = peekDeferredStreamingFinalization(session);
+  const winnerLoserAware = deferredMeta?.billHedgeLosers === true;
+  if (
+    session.sessionId &&
+    deferredMeta?.priorityUpgradeRebindTargetProviderId != null &&
+    deferredMeta.priorityUpgradeRebindTargetProviderId === deferredMeta.providerId
+  ) {
+    const rebindSucceeded = statusCode >= 200 && statusCode < 300 && !errorMessage;
+    await (rebindSucceeded
+      ? finalizePriorityUpgradeRebindSuccess(
+          session.sessionId,
+          deferredMeta.priorityUpgradeRebindTargetProviderId
+        )
+      : finalizePriorityUpgradeRebindFailure(
+          session.sessionId,
+          deferredMeta.priorityUpgradeRebindTargetProviderId
+        ));
+    consumeDeferredStreamingFinalization(session);
+  }
   const { usageMetrics } = parseUsageFromResponseText(responseText, provider.providerType);
   const actualServiceTier = parseServiceTierFromResponseText(responseText);
   const codexPriorityBillingDecision = await resolveCodexPriorityBillingDecision(

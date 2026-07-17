@@ -19,41 +19,99 @@ const redis = {
     const hash = hashes.get(key);
     return fields.map((field) => hash?.get(field) ?? null);
   }),
-  del: vi.fn(async (key: string) => {
-    const removedValue = store.delete(key);
-    const removedHash = hashes.delete(key);
-    return removedValue || removedHash ? 1 : 0;
+  del: vi.fn(async (...keys: string[]) => {
+    let removed = 0;
+    for (const key of keys) {
+      if (store.delete(key) || hashes.delete(key)) removed += 1;
+    }
+    return removed;
   }),
   eval: vi.fn(async (script: string, keyCount: number, ...args: string[]) => {
-    if (script.includes("PRIORITY_UPGRADE_STREAK_UPDATE")) {
-      const [hashKey, epochKey, cancelledKey, providerId, expectedEpoch, success, firstByteMs] =
-        args;
+    if (script.includes("PRIORITY_UPGRADE_CONTEXT_PREPARE")) {
+      const [contextKey, hashKey, pendingKey, epochKey, cancelledKey, context] = args;
+      const changed = store.get(contextKey) !== context;
+      if (changed) {
+        hashes.delete(hashKey);
+        store.delete(pendingKey);
+        store.set(epochKey, String(Number(store.get(epochKey) ?? "0") + 1));
+        store.delete(cancelledKey);
+      }
+      store.set(contextKey, context);
+      return changed ? 1 : 0;
+    }
+    if (script.includes("PRIORITY_UPGRADE_BATCH_APPLY")) {
+      const [hashKey, epochKey, cancelledKey, pendingKey, expectedEpoch, _required, _ttl] = args;
+      if (!hashKey || !epochKey || !cancelledKey || pendingKey == null || !expectedEpoch) {
+        return [0];
+      }
+      if ((store.get(epochKey) ?? "0") !== expectedEpoch) return [0];
+      if (store.get(cancelledKey) === "1") return [0];
+
+      const hash = hashes.get(hashKey) ?? new Map<string, string>();
+      const response: Array<number | string> = [1, 0];
+      let winnerId = 0;
+      let winnerAverage = Number.POSITIVE_INFINITY;
+      let winnerCount = 0;
+      for (let index = 7; index < args.length; index += 3) {
+        const providerId = args[index];
+        const success = args[index + 1];
+        const firstByteMs = args[index + 2];
+        if (!providerId || !success || firstByteMs == null) continue;
+        if (success !== "1") {
+          hash.delete(providerId);
+          continue;
+        }
+        const [countRaw = "0", totalRaw = "0"] = (hash.get(providerId) ?? "0:0").split(":");
+        const count = Number.parseInt(countRaw, 10) + 1;
+        const total = Number.parseFloat(totalRaw) + Number.parseFloat(firstByteMs);
+        hash.set(providerId, `${count}:${total.toFixed(6)}`);
+        response.push(providerId, count, total.toFixed(6));
+        const average = total / count;
+        const numericId = Number.parseInt(providerId, 10);
+        if (
+          count >= 3 &&
+          (average < winnerAverage ||
+            (average === winnerAverage &&
+              (count > winnerCount || (count === winnerCount && numericId < winnerId))))
+        ) {
+          winnerId = numericId;
+          winnerAverage = average;
+          winnerCount = count;
+        }
+      }
+      if (hash.size > 0) hashes.set(hashKey, hash);
+      else hashes.delete(hashKey);
+      response[1] = winnerId;
+      if (pendingKey !== "" && winnerId > 0) {
+        store.set(pendingKey, `${winnerId}:${expectedEpoch}`);
+      }
+      return response;
+    }
+    if (script.includes("PRIORITY_UPGRADE_REBIND_FINALIZE")) {
+      const [hashKey, epochKey, cancelledKey, pendingKey, contextKey, providerId, success] = args;
       if (
-        !hashKey ||
         !epochKey ||
         !cancelledKey ||
+        !pendingKey ||
+        !hashKey ||
+        !contextKey ||
         !providerId ||
-        !expectedEpoch ||
-        !success ||
-        !firstByteMs
-      ) {
-        return null;
+        !success
+      )
+        return 0;
+      const nextEpoch = Number.parseInt(store.get(epochKey) ?? "0", 10) + 1;
+      store.set(epochKey, String(nextEpoch));
+      store.set(cancelledKey, "1");
+      store.delete(pendingKey);
+      store.delete(contextKey);
+      if (success === "1") {
+        hashes.delete(hashKey);
+      } else {
+        const hash = hashes.get(hashKey);
+        hash?.delete(providerId);
+        if (hash?.size === 0) hashes.delete(hashKey);
       }
-      if ((store.get(epochKey) ?? "0") !== expectedEpoch) return null;
-      if (store.get(cancelledKey) === "1") return null;
-      const hash = hashes.get(hashKey) ?? new Map<string, string>();
-      if (success !== "1") {
-        hash.delete(providerId);
-        if (hash.size === 0) hashes.delete(hashKey);
-        return "0:0";
-      }
-      const [countRaw = "0", totalRaw = "0"] = (hash.get(providerId) ?? "0:0").split(":");
-      const count = Number.parseInt(countRaw, 10) + 1;
-      const total = Number.parseFloat(totalRaw) + Number.parseFloat(firstByteMs);
-      const encoded = `${count}:${total.toFixed(6)}`;
-      hash.set(providerId, encoded);
-      hashes.set(hashKey, hash);
-      return encoded;
+      return nextEpoch;
     }
     if (keyCount === 1 && script.includes("redis.call('PEXPIRE'")) {
       const [key, ownerToken] = args;
@@ -98,15 +156,19 @@ vi.mock("@/lib/logger", () => ({
 }));
 
 import {
+  applyPriorityUpgradeProbeBatchIfEpoch,
   clearPriorityUpgradeProbeSuccessStates,
   PRIORITY_UPGRADE_PROBE,
   collectPriorityUpgradeProbeWindow,
   consumePendingPriorityRebind,
   createPriorityUpgradeProbeBatches,
+  finalizePriorityUpgradeRebindFailure,
+  finalizePriorityUpgradeRebindSuccess,
   getPendingPriorityRebind,
   getPriorityUpgradeProbeSuccessStates,
   isPriorityUpgradeFirstByteSlaMet,
   isPriorityUpgradeProbeEnabled,
+  preparePriorityUpgradeProbeContext,
   prioritizePriorityUpgradeProbeCandidates,
   recordPriorityUpgradeProbeOutcomeIfEpoch,
   refreshSessionProbeRoundLock,
@@ -114,7 +176,6 @@ import {
   releaseSessionProbeRoundLock,
   selectPriorityUpgradeStreakWinner,
   setPendingPriorityRebindIfEpoch,
-  shouldClearPriorityUpgradeProbeSuccessStates,
   tryAcquireProviderProbeLock,
   tryAcquireSessionProbeGate,
   tryAcquireSessionProbeRoundLock,
@@ -290,6 +351,89 @@ describe("priority-upgrade probe", () => {
     });
   });
 
+  it("applies a complete batch atomically and publishes the lowest three-pass average", async () => {
+    const sessionId = "session-atomic-batch";
+    const expectedEpoch = 5;
+    store.set(`session:${sessionId}:priority_upgrade_probe_epoch`, String(expectedEpoch));
+
+    for (const firstByteMs of [300, 300]) {
+      await recordPriorityUpgradeProbeOutcomeIfEpoch({
+        sessionId,
+        providerId: 11,
+        success: true,
+        firstByteMs,
+        expectedEpoch,
+      });
+    }
+    for (const firstByteMs of [100, 100]) {
+      await recordPriorityUpgradeProbeOutcomeIfEpoch({
+        sessionId,
+        providerId: 22,
+        success: true,
+        firstByteMs,
+        expectedEpoch,
+      });
+    }
+    await recordPriorityUpgradeProbeOutcomeIfEpoch({
+      sessionId,
+      providerId: 33,
+      success: true,
+      firstByteMs: 50,
+      expectedEpoch,
+    });
+
+    const result = await applyPriorityUpgradeProbeBatchIfEpoch({
+      sessionId,
+      expectedEpoch,
+      outcomes: [
+        { providerId: 11, success: true, firstByteMs: 100 },
+        { providerId: 22, success: true, firstByteMs: 200 },
+        { providerId: 33, success: false },
+      ],
+    });
+
+    expect(result).toMatchObject({ applied: true, winnerProviderId: 22 });
+    expect(result.successStates).toEqual([
+      {
+        providerId: 11,
+        consecutiveSuccesses: 3,
+        totalFirstByteMs: 700,
+        averageFirstByteMs: 700 / 3,
+      },
+      {
+        providerId: 22,
+        consecutiveSuccesses: 3,
+        totalFirstByteMs: 400,
+        averageFirstByteMs: 400 / 3,
+      },
+    ]);
+    await expect(getPendingPriorityRebind(sessionId)).resolves.toBe(22);
+    expect(store.get(`session:${sessionId}:priority_upgrade_pending`)).toBe(`22:${expectedEpoch}`);
+    await expect(getPriorityUpgradeProbeSuccessStates(sessionId, [33])).resolves.toEqual([]);
+  });
+
+  it("invalidates old progress and in-flight epochs when routing context changes", async () => {
+    const sessionId = "session-context-scope";
+    store.set(`session:${sessionId}:priority_upgrade_probe_context`, "old-context");
+    store.set(`session:${sessionId}:priority_upgrade_probe_epoch`, "8");
+    const state = await recordPriorityUpgradeProbeOutcomeIfEpoch({
+      sessionId,
+      providerId: 55,
+      success: true,
+      firstByteMs: 90,
+      expectedEpoch: 8,
+    });
+    expect(state?.consecutiveSuccesses).toBe(1);
+    await setPendingPriorityRebindIfEpoch(sessionId, 55, 8);
+    store.set(`session:${sessionId}:priority_upgrade_probe_cancelled`, "1");
+
+    await expect(preparePriorityUpgradeProbeContext(sessionId, "new-context")).resolves.toBe(true);
+    await expect(getPriorityUpgradeProbeSuccessStates(sessionId, [55])).resolves.toEqual([]);
+    await expect(getPendingPriorityRebind(sessionId)).resolves.toBeNull();
+    expect(store.get(`session:${sessionId}:priority_upgrade_probe_epoch`)).toBe("9");
+    expect(store.has(`session:${sessionId}:priority_upgrade_probe_cancelled`)).toBe(false);
+  });
+
   it("prioritizes candidates with success progress before the frozen weighted remainder", () => {
     const weightedPlan = [{ id: 1 }, { id: 2 }, { id: 3 }, { id: 4 }];
     const ordered = prioritizePriorityUpgradeProbeCandidates(weightedPlan, [
@@ -343,31 +487,60 @@ describe("priority-upgrade probe", () => {
     );
   });
 
-  it("clears progress only when the real pending target wins and binding updates", () => {
-    expect(
-      shouldClearPriorityUpgradeProbeSuccessStates({
-        isPendingRebind: true,
-        bindingUpdated: true,
-        winningProviderId: 22,
-        pendingProviderId: 22,
-      })
-    ).toBe(true);
-    expect(
-      shouldClearPriorityUpgradeProbeSuccessStates({
-        isPendingRebind: true,
-        bindingUpdated: true,
-        winningProviderId: 33,
-        pendingProviderId: 22,
-      })
-    ).toBe(false);
-    expect(
-      shouldClearPriorityUpgradeProbeSuccessStates({
-        isPendingRebind: true,
-        bindingUpdated: false,
-        winningProviderId: 22,
-        pendingProviderId: 22,
-      })
-    ).toBe(false);
+  it("finalizes a real pending rebind atomically", async () => {
+    const successSession = "session-rebind-success";
+    store.set(`session:${successSession}:priority_upgrade_probe_epoch`, "9");
+    await recordPriorityUpgradeProbeOutcomeIfEpoch({
+      sessionId: successSession,
+      providerId: 22,
+      success: true,
+      firstByteMs: 100,
+      expectedEpoch: 9,
+    });
+    await recordPriorityUpgradeProbeOutcomeIfEpoch({
+      sessionId: successSession,
+      providerId: 33,
+      success: true,
+      firstByteMs: 120,
+      expectedEpoch: 9,
+    });
+    store.set(`session:${successSession}:priority_upgrade_pending`, "22:9");
+
+    await expect(finalizePriorityUpgradeRebindSuccess(successSession, 22)).resolves.toBe(true);
+    expect(store.get(`session:${successSession}:priority_upgrade_probe_epoch`)).toBe("10");
+    expect(store.get(`session:${successSession}:priority_upgrade_probe_cancelled`)).toBe("1");
+    expect(store.has(`session:${successSession}:priority_upgrade_pending`)).toBe(false);
+    await expect(getPriorityUpgradeProbeSuccessStates(successSession, [22, 33])).resolves.toEqual(
+      []
+    );
+
+    const failureSession = "session-rebind-failure";
+    store.set(`session:${failureSession}:priority_upgrade_probe_epoch`, "4");
+    await recordPriorityUpgradeProbeOutcomeIfEpoch({
+      sessionId: failureSession,
+      providerId: 22,
+      success: true,
+      firstByteMs: 100,
+      expectedEpoch: 4,
+    });
+    await recordPriorityUpgradeProbeOutcomeIfEpoch({
+      sessionId: failureSession,
+      providerId: 33,
+      success: true,
+      firstByteMs: 120,
+      expectedEpoch: 4,
+    });
+
+    await expect(finalizePriorityUpgradeRebindFailure(failureSession, 22)).resolves.toBe(true);
+    expect(store.get(`session:${failureSession}:priority_upgrade_probe_epoch`)).toBe("5");
+    await expect(getPriorityUpgradeProbeSuccessStates(failureSession, [22, 33])).resolves.toEqual([
+      {
+        providerId: 33,
+        consecutiveSuccesses: 1,
+        totalFirstByteMs: 120,
+        averageFirstByteMs: 120,
+      },
+    ]);
   });
 
   it("rejects stale streak updates and clears all progress only after a real rebind", async () => {

@@ -23,6 +23,7 @@ vi.mock("@/lib/rate-limit", () => rateLimitMocks);
 const probeMocks = vi.hoisted(() => ({
   consumePendingPriorityRebind: vi.fn(async () => null),
   isPriorityUpgradeProbeEnabled: vi.fn(() => true),
+  preparePriorityUpgradeProbeContext: vi.fn(async () => true),
 }));
 vi.mock("@/lib/priority-upgrade-probe", () => probeMocks);
 vi.mock("@/lib/utils/timezone", () => ({ resolveSystemTimezone: vi.fn(async () => "UTC") }));

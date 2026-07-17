@@ -22,6 +22,8 @@ export const PRIORITY_UPGRADE_PROBE = {
   DEFAULT_TIMEOUT_MS: 5_000,
   /** Per-provider cheap-test lock TTL (prevents concurrent duplicate tests). */
   PROVIDER_LOCK_MS: 210_000,
+  /** Leave enough time to persist/release before the provider/global lease expires. */
+  PROVIDER_LOCK_RELEASE_MARGIN_MS: 30_000,
   /** Per-session whole-round lease TTL (prevents overlapping rounds). */
   SESSION_ROUND_LOCK_MS: 210_000,
   /** Refresh the whole-round lease while a long probe is still running. */
@@ -51,6 +53,10 @@ function probeCancelledKey(sessionId: string): string {
 
 function probeSuccessStateKey(sessionId: string): string {
   return `session:${sessionId}:priority_upgrade_probe_successes`;
+}
+
+function probeContextKey(sessionId: string): string {
+  return `session:${sessionId}:priority_upgrade_probe_context`;
 }
 
 export interface PriorityUpgradeProbeSuccessState {
@@ -131,9 +137,213 @@ export function prioritizePriorityUpgradeProbeCandidates<T extends { id: number 
   return [...progressing, ...candidates.filter((candidate) => !progressingIds.has(candidate.id))];
 }
 
+export interface PriorityUpgradeProbeBatchOutcome {
+  providerId: number;
+  success: boolean;
+  firstByteMs?: number;
+}
+
+export interface PriorityUpgradeProbeBatchResult {
+  applied: boolean;
+  winnerProviderId: number | null;
+  successStates: PriorityUpgradeProbeSuccessState[];
+}
+
+/**
+ * Bind probe progress to one routing context. A model, API format, provider group,
+ * or sticky source change invalidates both the old streak hash and its pending target.
+ */
+export async function preparePriorityUpgradeProbeContext(
+  sessionId: string,
+  context: string
+): Promise<boolean> {
+  const redis = getRedisClient();
+  if (redis?.status !== "ready") return false;
+
+  try {
+    const ttl = Number.parseInt(process.env.SESSION_TTL || "300", 10);
+    const ttlSeconds = Number.isFinite(ttl) ? Math.max(1, ttl) : 300;
+    await redis.eval(
+      `
+        -- PRIORITY_UPGRADE_CONTEXT_PREPARE
+        local current = redis.call('GET', KEYS[1])
+        if current ~= ARGV[1] then
+          redis.call('DEL', KEYS[2])
+          redis.call('DEL', KEYS[3])
+          redis.call('INCR', KEYS[4])
+          redis.call('EXPIRE', KEYS[4], 3600)
+          redis.call('DEL', KEYS[5])
+        end
+        redis.call('SET', KEYS[1], ARGV[1], 'EX', tonumber(ARGV[2]))
+        return current == ARGV[1] and 0 or 1
+      `,
+      5,
+      probeContextKey(sessionId),
+      probeSuccessStateKey(sessionId),
+      pendingRebindKey(sessionId),
+      probeEpochKey(sessionId),
+      probeCancelledKey(sessionId),
+      context,
+      ttlSeconds.toString()
+    );
+    return true;
+  } catch (error) {
+    logger.warn("Failed to prepare priority upgrade probe context", {
+      sessionId,
+      error,
+    });
+    return false;
+  }
+}
+
+/**
+ * Apply every retained/direct outcome from one logical batch in one Redis Lua
+ * transaction. The transaction validates epoch/cancel once, updates every streak,
+ * chooses same-batch qualifiers by lowest running average, and publishes pending.
+ */
+export async function applyPriorityUpgradeProbeBatchIfEpoch(params: {
+  sessionId: string;
+  outcomes: readonly PriorityUpgradeProbeBatchOutcome[];
+  expectedEpoch: number;
+  publishWinner?: boolean;
+}): Promise<PriorityUpgradeProbeBatchResult> {
+  if (
+    params.outcomes.length === 0 ||
+    params.outcomes.some((outcome) => outcome.success && !Number.isFinite(outcome.firstByteMs))
+  ) {
+    return { applied: false, winnerProviderId: null, successStates: [] };
+  }
+  const normalized = params.outcomes.map((outcome) => {
+    const firstByteMs =
+      outcome.success && Number.isFinite(outcome.firstByteMs)
+        ? Math.max(0, outcome.firstByteMs ?? 0)
+        : 0;
+    return { ...outcome, firstByteMs };
+  });
+
+  const redis = getRedisClient();
+  if (redis?.status !== "ready") {
+    return { applied: false, winnerProviderId: null, successStates: [] };
+  }
+
+  try {
+    const ttl = Number.parseInt(process.env.SESSION_TTL || "300", 10);
+    const ttlSeconds = Number.isFinite(ttl) ? Math.max(1, ttl) : 300;
+    const raw = await redis.eval(
+      `
+        -- PRIORITY_UPGRADE_BATCH_APPLY
+        local current_epoch = tonumber(redis.call('GET', KEYS[2]) or '0')
+        if current_epoch ~= tonumber(ARGV[1]) then return {0} end
+        if redis.call('GET', KEYS[3]) == '1' then return {0} end
+
+        local winner_id = 0
+        local winner_average = nil
+        local response = {1, '0'}
+        local offset = 4
+        while offset <= #ARGV do
+          local provider_id = ARGV[offset]
+          local succeeded = ARGV[offset + 1] == '1'
+          local first_byte_ms = tonumber(ARGV[offset + 2]) or 0
+          if not succeeded then
+            redis.call('HDEL', KEYS[1], provider_id)
+          else
+            local previous = redis.call('HGET', KEYS[1], provider_id)
+            local count = 0
+            local total = 0
+            if previous then
+              local separator = string.find(previous, ':', 1, true)
+              if separator then
+                count = tonumber(string.sub(previous, 1, separator - 1)) or 0
+                total = tonumber(string.sub(previous, separator + 1)) or 0
+              end
+            end
+            count = count + 1
+            total = total + first_byte_ms
+            local encoded = tostring(count) .. ':' .. string.format('%.6f', total)
+            redis.call('HSET', KEYS[1], provider_id, encoded)
+            table.insert(response, provider_id)
+            table.insert(response, tostring(count))
+            table.insert(response, string.format('%.6f', total))
+
+            if count >= tonumber(ARGV[2]) then
+              local average = total / count
+              if winner_average == nil or average < winner_average or
+                 (average == winner_average and tonumber(provider_id) < winner_id) then
+                winner_id = tonumber(provider_id)
+                winner_average = average
+              end
+            end
+          end
+          offset = offset + 3
+        end
+
+        if redis.call('HLEN', KEYS[1]) == 0 then
+          redis.call('DEL', KEYS[1])
+        else
+          redis.call('EXPIRE', KEYS[1], tonumber(ARGV[3]))
+        end
+        if winner_id > 0 and KEYS[4] ~= '' then
+          redis.call(
+            'SET',
+            KEYS[4],
+            tostring(winner_id) .. ':' .. tostring(current_epoch),
+            'EX',
+            tonumber(ARGV[3])
+          )
+        end
+        response[2] = tostring(winner_id)
+        return response
+      `,
+      4,
+      probeSuccessStateKey(params.sessionId),
+      probeEpochKey(params.sessionId),
+      probeCancelledKey(params.sessionId),
+      params.publishWinner === false ? "" : pendingRebindKey(params.sessionId),
+      String(params.expectedEpoch),
+      String(PRIORITY_UPGRADE_PROBE.REQUIRED_CONSECUTIVE_SUCCESSES),
+      String(ttlSeconds),
+      ...normalized.flatMap((outcome) => [
+        String(outcome.providerId),
+        outcome.success ? "1" : "0",
+        String(outcome.firstByteMs),
+      ])
+    );
+
+    if (!Array.isArray(raw) || Number(raw[0]) !== 1) {
+      return { applied: false, winnerProviderId: null, successStates: [] };
+    }
+    const winner = Number.parseInt(String(raw[1] ?? "0"), 10);
+    const successStates: PriorityUpgradeProbeSuccessState[] = [];
+    for (let index = 2; index + 2 < raw.length; index += 3) {
+      const providerId = Number.parseInt(String(raw[index]), 10);
+      const count = Number.parseInt(String(raw[index + 1]), 10);
+      const total = Number.parseFloat(String(raw[index + 2]));
+      if (providerId > 0 && count > 0 && Number.isFinite(total)) {
+        successStates.push({
+          providerId,
+          consecutiveSuccesses: count,
+          totalFirstByteMs: total,
+          averageFirstByteMs: total / count,
+        });
+      }
+    }
+    return {
+      applied: true,
+      winnerProviderId: Number.isFinite(winner) && winner > 0 ? winner : null,
+      successStates,
+    };
+  } catch (error) {
+    logger.debug("PriorityUpgradeProbe: failed to apply atomic probe batch", {
+      sessionId: params.sessionId,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return { applied: false, winnerProviderId: null, successStates: [] };
+  }
+}
+
 /**
  * Atomically append one in-SLA success or reset the provider streak on any failure.
- * A real hedge race invalidates the update through the session probe epoch.
+ * Kept as a one-outcome wrapper for focused tests and callers outside batch probing.
  */
 export async function recordPriorityUpgradeProbeOutcomeIfEpoch(params: {
   sessionId: string;
@@ -142,95 +352,99 @@ export async function recordPriorityUpgradeProbeOutcomeIfEpoch(params: {
   firstByteMs?: number;
   expectedEpoch: number;
 }): Promise<PriorityUpgradeProbeSuccessState | null> {
-  const redis = getRedisClient();
-  if (redis?.status !== "ready") return null;
-  if (params.success && !Number.isFinite(params.firstByteMs)) return null;
-  try {
-    const ttl = Number.parseInt(process.env.SESSION_TTL || "300", 10);
-    const ttlSeconds = Number.isFinite(ttl) ? Math.max(1, ttl) : 300;
-    const safeFirstByteMs =
-      params.success && Number.isFinite(params.firstByteMs)
-        ? Math.max(0, params.firstByteMs ?? 0)
-        : 0;
-    const raw = await redis.eval(
-      `
-        -- PRIORITY_UPGRADE_STREAK_UPDATE
-        local current_epoch = tonumber(redis.call('GET', KEYS[2]) or '0')
-        if current_epoch ~= tonumber(ARGV[2]) then return nil end
-        if redis.call('GET', KEYS[3]) == '1' then return nil end
-        if ARGV[3] ~= '1' then
-          redis.call('HDEL', KEYS[1], ARGV[1])
-          if redis.call('HLEN', KEYS[1]) == 0 then redis.call('DEL', KEYS[1]) end
-          return '0:0'
-        end
-        local previous = redis.call('HGET', KEYS[1], ARGV[1])
-        local count = 0
-        local total = 0
-        if previous then
-          local separator = string.find(previous, ':', 1, true)
-          if separator then
-            count = tonumber(string.sub(previous, 1, separator - 1)) or 0
-            total = tonumber(string.sub(previous, separator + 1)) or 0
-          end
-        end
-        count = count + 1
-        total = total + tonumber(ARGV[4])
-        local encoded = tostring(count) .. ':' .. string.format('%.6f', total)
-        redis.call('HSET', KEYS[1], ARGV[1], encoded)
-        redis.call('EXPIRE', KEYS[1], tonumber(ARGV[5]))
-        return encoded
-      `,
-      3,
-      probeSuccessStateKey(params.sessionId),
-      probeEpochKey(params.sessionId),
-      probeCancelledKey(params.sessionId),
-      String(params.providerId),
-      String(params.expectedEpoch),
-      params.success ? "1" : "0",
-      String(safeFirstByteMs),
-      String(ttlSeconds)
-    );
-    if (typeof raw !== "string") return null;
-    if (!params.success) {
-      return {
+  const result = await applyPriorityUpgradeProbeBatchIfEpoch({
+    sessionId: params.sessionId,
+    expectedEpoch: params.expectedEpoch,
+    publishWinner: false,
+    outcomes: [
+      {
         providerId: params.providerId,
-        consecutiveSuccesses: 0,
-        totalFirstByteMs: 0,
-        averageFirstByteMs: 0,
-      };
-    }
-    return parseProbeSuccessState(params.providerId, raw);
-  } catch (error) {
-    logger.debug("PriorityUpgradeProbe: failed to update success streak", {
-      sessionId: params.sessionId,
+        success: params.success,
+        firstByteMs: params.firstByteMs,
+      },
+    ],
+  });
+  if (!result.applied) return null;
+  if (!params.success) {
+    return {
       providerId: params.providerId,
-      error: error instanceof Error ? error.message : String(error),
-    });
-    return null;
+      consecutiveSuccesses: 0,
+      totalFirstByteMs: 0,
+      averageFirstByteMs: 0,
+    };
   }
+  return result.successStates.find((state) => state.providerId === params.providerId) ?? null;
 }
 
 export async function clearPriorityUpgradeProbeSuccessStates(sessionId: string): Promise<void> {
   const redis = getRedisClient();
   if (redis?.status !== "ready") return;
   try {
-    await redis.del(probeSuccessStateKey(sessionId));
+    await redis.del(probeSuccessStateKey(sessionId), probeContextKey(sessionId));
   } catch {
     // Best effort: SESSION_TTL still bounds stale progress.
   }
 }
 
-export function shouldClearPriorityUpgradeProbeSuccessStates(params: {
-  isPendingRebind: boolean;
-  bindingUpdated: boolean;
-  winningProviderId: number;
-  pendingProviderId: number;
-}): boolean {
-  return (
-    params.isPendingRebind &&
-    params.bindingUpdated &&
-    params.winningProviderId === params.pendingProviderId
-  );
+async function finalizePriorityUpgradeRebindState(params: {
+  sessionId: string;
+  providerId: number;
+  success: boolean;
+}): Promise<boolean> {
+  const redis = getRedisClient();
+  if (redis?.status !== "ready") return false;
+  try {
+    const result = await redis.eval(
+      `
+        -- PRIORITY_UPGRADE_REBIND_FINALIZE
+        local epoch = redis.call('INCR', KEYS[2])
+        redis.call('EXPIRE', KEYS[2], 3600)
+        redis.call('SET', KEYS[3], '1', 'EX', 60)
+        redis.call('DEL', KEYS[4])
+        redis.call('DEL', KEYS[5])
+        if ARGV[2] == '1' then
+          redis.call('DEL', KEYS[1])
+        else
+          redis.call('HDEL', KEYS[1], ARGV[1])
+          if redis.call('HLEN', KEYS[1]) == 0 then redis.call('DEL', KEYS[1]) end
+        end
+        return epoch
+      `,
+      5,
+      probeSuccessStateKey(params.sessionId),
+      probeEpochKey(params.sessionId),
+      probeCancelledKey(params.sessionId),
+      pendingRebindKey(params.sessionId),
+      probeContextKey(params.sessionId),
+      String(params.providerId),
+      params.success ? "1" : "0"
+    );
+    return Number.isFinite(Number(result));
+  } catch (error) {
+    logger.debug("PriorityUpgradeProbe: failed to finalize real rebind state", {
+      sessionId: params.sessionId,
+      providerId: params.providerId,
+      success: params.success,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return false;
+  }
+}
+
+/** Full real-response success: invalidate older probes and clear every candidate streak. */
+export function finalizePriorityUpgradeRebindSuccess(
+  sessionId: string,
+  providerId: number
+): Promise<boolean> {
+  return finalizePriorityUpgradeRebindState({ sessionId, providerId, success: true });
+}
+
+/** Real target failure: invalidate older probes and reset only the failed target. */
+export function finalizePriorityUpgradeRebindFailure(
+  sessionId: string,
+  providerId: number
+): Promise<boolean> {
+  return finalizePriorityUpgradeRebindState({ sessionId, providerId, success: false });
 }
 
 export function selectPriorityUpgradeStreakWinner<

@@ -14,6 +14,15 @@ import type { Provider } from "@/types/provider";
 
 const asyncTasks: Promise<void>[] = [];
 const STREAM_STATS_HEAD_BYTES_FOR_TEST = 1024 * 1024;
+const priorityUpgradeMocks = vi.hoisted(() => ({
+  finalizeSuccess: vi.fn(async () => true),
+  finalizeFailure: vi.fn(async () => true),
+}));
+
+vi.mock("@/lib/priority-upgrade-probe", () => ({
+  finalizePriorityUpgradeRebindSuccess: priorityUpgradeMocks.finalizeSuccess,
+  finalizePriorityUpgradeRebindFailure: priorityUpgradeMocks.finalizeFailure,
+}));
 
 vi.mock("@/app/v1/_lib/proxy/response-fixer", () => ({
   ResponseFixer: {
@@ -739,6 +748,7 @@ describe("ProxyResponseHandler stream client abort finalization", () => {
     const controller = new AbortController();
     controller.abort();
     const session = createSession(controller.signal);
+    session.sessionId = "session_rebind_complete";
     setDeferredStreamingFinalization(session, {
       providerId: 1,
       providerName: "avemujica-responses",
@@ -750,6 +760,7 @@ describe("ProxyResponseHandler stream client abort finalization", () => {
       endpointId: 42,
       endpointUrl: "https://api.test.invalid/v1",
       upstreamStatusCode: 200,
+      priorityUpgradeRebindTargetProviderId: 1,
     });
 
     await ProxyResponseHandler.dispatch(session, createResponsesSse());
@@ -765,6 +776,8 @@ describe("ProxyResponseHandler stream client abort finalization", () => {
         outputTokens: 11,
       })
     );
+    expect(priorityUpgradeMocks.finalizeSuccess).toHaveBeenCalledWith("session_rebind_complete", 1);
+    expect(priorityUpgradeMocks.finalizeFailure).not.toHaveBeenCalled();
   });
 
   it("keeps stream accounting bounded for oversized successful streams", async () => {
@@ -923,6 +936,7 @@ describe("ProxyResponseHandler stream client abort finalization", () => {
     const controller = new AbortController();
     controller.abort();
     const session = createSession(controller.signal);
+    session.sessionId = "session_rebind_aborted";
     setDeferredStreamingFinalization(session, {
       providerId: 1,
       providerName: "avemujica-responses",
@@ -934,6 +948,7 @@ describe("ProxyResponseHandler stream client abort finalization", () => {
       endpointId: 42,
       endpointUrl: "https://api.test.invalid/v1",
       upstreamStatusCode: 200,
+      priorityUpgradeRebindTargetProviderId: 1,
     });
 
     await ProxyResponseHandler.dispatch(session, createErroredResponsesSse());
@@ -947,6 +962,8 @@ describe("ProxyResponseHandler stream client abort finalization", () => {
         errorMessage: "CLIENT_ABORTED",
       })
     );
+    expect(priorityUpgradeMocks.finalizeFailure).toHaveBeenCalledWith("session_rebind_aborted", 1);
+    expect(priorityUpgradeMocks.finalizeSuccess).not.toHaveBeenCalled();
   });
 
   it("keeps a truncated client-aborted Claude stream as 499 despite message_start usage (U01)", async () => {

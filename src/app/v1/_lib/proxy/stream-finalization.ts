@@ -35,6 +35,8 @@ export type DeferredStreamingFinalization = {
    * coexists with asynchronously accumulated loser costs without clobbering.
    */
   billHedgeLosers?: boolean;
+  /** Exact pending-rebind target; only full-response finalization may clear/reset its streak. */
+  priorityUpgradeRebindTargetProviderId?: number;
 };
 
 const deferredMeta = new WeakMap<ProxySession, DeferredStreamingFinalization>();

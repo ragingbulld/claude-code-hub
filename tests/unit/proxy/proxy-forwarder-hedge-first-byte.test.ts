@@ -61,6 +61,7 @@ const mocks = vi.hoisted(() => ({
   storeSessionSpecialSettings: vi.fn(async () => {}),
   storeSessionRequestPhaseSnapshot: vi.fn(async () => {}),
   storeSessionResponsePhaseSnapshot: vi.fn(async () => {}),
+  finalizePriorityUpgradeRebindFailure: vi.fn(async () => true),
 }));
 
 vi.mock("@/lib/logger", () => ({
@@ -73,6 +74,14 @@ vi.mock("@/lib/logger", () => ({
     fatal: vi.fn(),
   },
 }));
+
+vi.mock("@/lib/priority-upgrade-probe", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/lib/priority-upgrade-probe")>();
+  return {
+    ...actual,
+    finalizePriorityUpgradeRebindFailure: mocks.finalizePriorityUpgradeRebindFailure,
+  };
+});
 
 vi.mock("@/lib/config", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/lib/config")>();
@@ -1607,6 +1616,61 @@ describe("ProxyForwarder - first-byte hedge scheduling", () => {
       expect(await response.text()).toContain('"provider":"window-refill"');
       expect(session.provider?.id).toBe(refill.id);
       expect(mocks.buildPriorityRacePlan).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("a pending rebind target failure before first byte resets its three-pass streak", async () => {
+    vi.useFakeTimers();
+
+    try {
+      const target = createProvider({ id: 61, name: "pending-target", priority: 0 });
+      const session = createSession();
+      session.setProvider(target);
+      session.setPriorityUpgradePlan({
+        mode: "apply_pending_rebind",
+        stickyProviderId: 60,
+        higherPriorityProviderId: target.id,
+        higherPriorityProviderIds: [target.id],
+        probeEpoch: 7,
+        stickyPriority: 1,
+        higherPriority: 0,
+      });
+      mocks.buildPriorityRacePlan.mockResolvedValueOnce([]);
+      mocks.categorizeErrorAsync.mockResolvedValue(ProxyErrorCategory.PROVIDER_ERROR);
+
+      const doForward = vi.spyOn(
+        ProxyForwarder as unknown as {
+          doForward: (...args: unknown[]) => Promise<Response>;
+        },
+        "doForward"
+      );
+      doForward.mockImplementationOnce(async (attemptSession, providerValue) => {
+        const provider = providerValue as Provider;
+        const runtime = attemptSession as ProxySession & AttemptRuntime;
+        const controller = new AbortController();
+        runtime.responseController = controller;
+        runtime.clearResponseTimeout = vi.fn();
+        return createDelayedFailure({
+          delayMs: 10,
+          error: new UpstreamProxyError("pending target failed", 502, {
+            body: "provider_failed",
+            providerId: provider.id,
+            providerName: provider.name,
+          }),
+          controller,
+        });
+      });
+
+      const responsePromise = ProxyForwarder.send(session);
+      const rejectionExpectation = expect(responsePromise).rejects.toBeDefined();
+      await vi.advanceTimersByTimeAsync(50);
+      await rejectionExpectation;
+      expect(mocks.finalizePriorityUpgradeRebindFailure).toHaveBeenCalledWith(
+        "sess-hedge",
+        target.id
+      );
     } finally {
       vi.useRealTimers();
     }

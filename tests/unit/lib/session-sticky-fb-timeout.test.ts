@@ -31,12 +31,13 @@ vi.mock("@/lib/redis", () => {
         return "OK";
       },
       eval: async (_script: string, _keyCount: number, ...args: string[]) => {
-        const [epochKey, cancelledKey, pendingKey] = args;
+        const [epochKey, cancelledKey, pendingKey, successStateKey] = args;
         if (!epochKey || !cancelledKey || !pendingKey) return 0;
         const next = Number.parseInt(store.get(epochKey) ?? "0", 10) + 1;
         store.set(epochKey, String(next));
         store.set(cancelledKey, "1");
         store.delete(pendingKey);
+        if (successStateKey) store.delete(successStateKey);
         return next;
       },
       pipeline: () => {
@@ -110,7 +111,11 @@ describe("SessionManager sticky first-byte timeout streak", () => {
     const sid = "sess_test_probe_cancel";
     expect(await SessionManager.isPriorityUpgradeProbeCancelled(sid)).toBe(false);
     expect(await SessionManager.getPriorityUpgradeProbeEpoch(sid)).toBe(0);
+    store.set(`session:${sid}:priority_upgrade_pending`, "22:0");
+    store.set(`session:${sid}:priority_upgrade_probe_successes`, "present");
     await SessionManager.markPriorityUpgradeProbeCancelled(sid);
+    expect(store.has(`session:${sid}:priority_upgrade_pending`)).toBe(false);
+    expect(store.has(`session:${sid}:priority_upgrade_probe_successes`)).toBe(true);
     expect(await SessionManager.isPriorityUpgradeProbeCancelled(sid)).toBe(true);
     expect(await SessionManager.getPriorityUpgradeProbeEpoch(sid)).toBe(1);
     await SessionManager.clearPriorityUpgradeProbeCancelled(sid);
