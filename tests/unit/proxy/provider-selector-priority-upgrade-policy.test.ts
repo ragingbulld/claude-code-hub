@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, test, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import type { Provider } from "@/types/provider";
 
 const circuitMocks = vi.hoisted(() => ({
@@ -52,6 +52,10 @@ describe("priority-upgrade candidate policy parity", () => {
     vi.clearAllMocks();
   });
 
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
   test("filters client-blocked, cost-limited, and vendor-circuit providers", async () => {
     const { ProxyProviderResolver } = await import("@/app/v1/_lib/proxy/provider-selector");
     const sticky = provider({ id: 10, name: "sticky", priority: 4 });
@@ -95,6 +99,7 @@ describe("priority-upgrade candidate policy parity", () => {
   });
 
   test("plans every eligible provider above the sticky priority in tier order", async () => {
+    vi.spyOn(Math, "random").mockReturnValue(0);
     const { ProxyProviderResolver } = await import("@/app/v1/_lib/proxy/provider-selector");
     const sticky = provider({ id: 10, name: "sticky", priority: 5 });
     const p1a = provider({ id: 1, name: "p1-a", priority: 1 });
@@ -125,5 +130,47 @@ describe("priority-upgrade candidate policy parity", () => {
     ).planPriorityUpgrade(session, sticky);
 
     expect(plan?.candidates.map((candidate) => candidate.id)).toEqual([p1a.id, p1b.id, p3.id]);
+  });
+
+  test("orders same-priority probe candidates by weighted sampling without replacement", async () => {
+    vi.spyOn(Math, "random")
+      .mockReturnValueOnce(0.1)
+      .mockReturnValueOnce(0.9)
+      .mockReturnValueOnce(0);
+    const { ProxyProviderResolver } = await import("@/app/v1/_lib/proxy/provider-selector");
+    const sticky = provider({ id: 10, name: "sticky", priority: 5 });
+    const low = provider({ id: 1, name: "low", priority: 1, weight: 1 });
+    const zero = provider({ id: 2, name: "zero", priority: 1, weight: 0 });
+    const high = provider({ id: 3, name: "high", priority: 1, weight: 20 });
+    const medium = provider({ id: 4, name: "medium", priority: 1, weight: 5 });
+    rateLimitMocks.RateLimitService.checkCostLimitsWithLease.mockResolvedValue({ allowed: true });
+
+    const session = {
+      sessionId: "priority-weighted-order",
+      originalFormat: "claude",
+      authState: null,
+      userAgent: "test-client/1.0",
+      headers: new Headers(),
+      request: { message: { metadata: null } },
+      getOriginalModel: () => "claude-test",
+      getProvidersSnapshot: async () => [sticky, low, zero, high, medium],
+    };
+
+    const plan = await (
+      ProxyProviderResolver as unknown as {
+        planPriorityUpgrade: (
+          currentSession: typeof session,
+          currentSticky: Provider
+        ) => Promise<{ candidates: Provider[] } | null>;
+      }
+    ).planPriorityUpgrade(session, sticky);
+
+    expect(plan?.candidates.map((candidate) => candidate.id)).toEqual([
+      high.id,
+      medium.id,
+      low.id,
+      zero.id,
+    ]);
+    expect(new Set(plan?.candidates.map((candidate) => candidate.id)).size).toBe(4);
   });
 });

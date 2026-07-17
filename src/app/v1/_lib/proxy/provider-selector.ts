@@ -774,6 +774,46 @@ export class ProxyProviderResolver {
   }
 
   /**
+   * Build a weighted random order without replacement for one probe priority tier.
+   * Higher-weight providers are more likely to enter the earlier probe batches,
+   * while every provider can still be reached if earlier batches fail.
+   */
+  private static orderProbeTierByWeight(providers: Provider[]): Provider[] {
+    const remaining = [...providers];
+    const ordered: Provider[] = [];
+
+    while (remaining.length > 0) {
+      if (remaining.length === 1) {
+        ordered.push(remaining[0]);
+        break;
+      }
+
+      const weights = remaining.map((provider) =>
+        Number.isFinite(provider.weight) ? Math.max(0, provider.weight) : 0
+      );
+      const totalWeight = weights.reduce((sum, weight) => sum + weight, 0);
+      let selectedIndex: number;
+
+      if (totalWeight <= 0) {
+        selectedIndex = Math.floor(Math.random() * remaining.length);
+      } else {
+        const target = Math.random() * totalWeight;
+        let cumulativeWeight = 0;
+        selectedIndex = weights.findIndex((weight) => {
+          cumulativeWeight += weight;
+          return target < cumulativeWeight;
+        });
+        if (selectedIndex < 0) selectedIndex = remaining.length - 1;
+      }
+
+      const [selected] = remaining.splice(selectedIndex, 1);
+      ordered.push(selected);
+    }
+
+    return ordered;
+  }
+
+  /**
    * Plan a priority-upgrade action when sticky is on a lower-priority provider.
    *
    * Modes:
@@ -866,8 +906,11 @@ export class ProxyProviderResolver {
     ].sort((a, b) => a - b);
 
     const candidatesToProbe = priorities.flatMap((priority) =>
-      higherCandidates.filter(
-        (p) => ProxyProviderResolver.resolveEffectivePriority(p, effectiveGroup) === priority
+      ProxyProviderResolver.orderProbeTierByWeight(
+        higherCandidates.filter(
+          (provider) =>
+            ProxyProviderResolver.resolveEffectivePriority(provider, effectiveGroup) === priority
+        )
       )
     );
 
