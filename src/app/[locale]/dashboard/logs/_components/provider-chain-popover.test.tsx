@@ -259,6 +259,8 @@ describe("provider-chain-popover priority-upgrade test marker", () => {
     const marker = document.querySelector('[data-priority-upgrade-test="true"]');
     expect(marker).not.toBeNull();
     expect(marker?.textContent).toBe("");
+    expect(marker?.getAttribute("data-probe-status")).toBe("testing");
+    expect(marker?.classList.contains("text-sky-500")).toBe(true);
     expect(marker?.querySelector(".animate-spin")).not.toBeNull();
     expect(marker?.getAttribute("title")).toBe("This request triggered a priority-upgrade test");
     const details = document.querySelector('[data-priority-upgrade-probe-details="true"]');
@@ -298,10 +300,41 @@ describe("provider-chain-popover priority-upgrade test marker", () => {
 
     const document = parseHtml(html);
     const marker = document.querySelector('[data-priority-upgrade-test="true"]');
+    expect(marker?.getAttribute("data-probe-status")).toBe("failed");
+    expect(marker?.classList.contains("text-rose-500")).toBe(true);
     expect(marker?.querySelector(".animate-spin")).toBeNull();
     const details = document.querySelector('[data-priority-upgrade-probe-details="true"]');
     expect(details?.textContent).toContain("Test failed");
     expect(details?.textContent).toContain("First byte 824ms");
+  });
+
+  test("uses cyan for a completed winning probe", () => {
+    const html = renderWithIntl(
+      <ProviderChainPopover
+        chain={[
+          { id: 1, name: "sticky", reason: "session_reuse" },
+          { id: 1, name: "sticky", reason: "request_success", statusCode: 200 },
+          {
+            id: 2,
+            name: "candidate",
+            reason: "priority_upgrade_probe",
+            errorMessage: "cheap_test_start",
+          },
+          {
+            id: 2,
+            name: "candidate",
+            reason: "priority_upgrade_probe",
+            errorMessage: "cheap_test_ok_pending_rebind_first_byte_ms=320",
+          },
+        ]}
+        finalProvider="sticky"
+      />
+    );
+
+    const marker = parseHtml(html).querySelector('[data-priority-upgrade-test="true"]');
+    expect(marker?.getAttribute("data-probe-status")).toBe("passed");
+    expect(marker?.classList.contains("text-cyan-500")).toBe(true);
+    expect(marker?.querySelector(".animate-spin")).toBeNull();
   });
 
   test("groups raw start and terminal events into one status per provider", () => {

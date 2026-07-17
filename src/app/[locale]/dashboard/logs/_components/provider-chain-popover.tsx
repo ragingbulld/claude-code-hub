@@ -97,6 +97,27 @@ function PriorityUpgradeProbePopover({ chain }: { chain: ProviderChainItem[] }) 
   if (records.length === 0) return null;
 
   const isTesting = records.some((record) => record.status === "testing");
+  const markerStatus: ProbeStatus = isTesting
+    ? "testing"
+    : records.some((record) => record.status === "passed")
+      ? "passed"
+      : records.some((record) => record.status === "passedNotSelected")
+        ? "passedNotSelected"
+        : records.some((record) => record.status === "failed")
+          ? "failed"
+          : "discarded";
+  const markerTone: Record<ProbeStatus, string> = {
+    testing:
+      "text-sky-500 hover:bg-sky-100 hover:text-sky-700 dark:text-sky-400 dark:hover:bg-sky-950/60",
+    passed:
+      "text-cyan-500 hover:bg-cyan-100 hover:text-cyan-700 dark:text-cyan-400 dark:hover:bg-cyan-950/60",
+    passedNotSelected:
+      "text-teal-500 hover:bg-teal-100 hover:text-teal-700 dark:text-teal-400 dark:hover:bg-teal-950/60",
+    failed:
+      "text-rose-500 hover:bg-rose-100 hover:text-rose-700 dark:text-rose-400 dark:hover:bg-rose-950/60",
+    discarded:
+      "text-slate-400 hover:bg-slate-100 hover:text-slate-600 dark:text-slate-500 dark:hover:bg-slate-800/70",
+  };
 
   return (
     <Popover>
@@ -106,9 +127,10 @@ function PriorityUpgradeProbePopover({ chain }: { chain: ProviderChainItem[] }) 
           variant="ghost"
           size="icon"
           data-priority-upgrade-test="true"
+          data-probe-status={markerStatus}
           title={tChain("priorityUpgrade.testTriggered")}
           aria-label={tChain("priorityUpgrade.openDetails")}
-          className="h-5 w-5 shrink-0 rounded-full p-0 text-violet-500 hover:bg-violet-100 hover:text-violet-700 dark:hover:bg-violet-950/60"
+          className={cn("h-5 w-5 shrink-0 rounded-full p-0", markerTone[markerStatus])}
         >
           {isTesting ? (
             <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" />
