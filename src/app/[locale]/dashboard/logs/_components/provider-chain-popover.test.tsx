@@ -262,7 +262,8 @@ describe("provider-chain-popover priority-upgrade test marker", () => {
     expect(marker?.getAttribute("data-probe-status")).toBe("testing");
     expect(marker?.classList.contains("text-sky-500")).toBe(true);
     expect(marker?.querySelector(".animate-spin")).not.toBeNull();
-    expect(marker?.getAttribute("title")).toBe("This request triggered a priority-upgrade test");
+    expect(marker?.getAttribute("title")).toBeNull();
+    expect(marker?.getAttribute("aria-label")).toBe("Open priority-upgrade test details");
     const details = document.querySelector('[data-priority-upgrade-probe-details="true"]');
     expect(details?.textContent).toContain("Priority upgrade test");
     expect(details?.textContent).toContain("higher-priority");

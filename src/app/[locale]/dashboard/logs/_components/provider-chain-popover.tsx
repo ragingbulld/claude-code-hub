@@ -128,7 +128,6 @@ function PriorityUpgradeProbePopover({ chain }: { chain: ProviderChainItem[] }) 
           size="icon"
           data-priority-upgrade-test="true"
           data-probe-status={markerStatus}
-          title={tChain("priorityUpgrade.testTriggered")}
           aria-label={tChain("priorityUpgrade.openDetails")}
           className={cn("h-5 w-5 shrink-0 rounded-full p-0", markerTone[markerStatus])}
         >
