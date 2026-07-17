@@ -1324,9 +1324,9 @@ describe("ProxyForwarder - first-byte hedge scheduling", () => {
       expect(mocks.recordFailure).not.toHaveBeenCalled();
       expect(mocks.recordSuccess).not.toHaveBeenCalled();
       expect(session.provider?.id).toBe(1);
-      // Initial provider won the race (launchedProviderCount > 1): the binding
-      // must still be force-updated to the winner (forceUpdate=true), closing
-      // the gap where the smart path could keep a stale/higher-priority binding.
+      // The original sticky provider won only after its first-byte threshold.
+      // It may finish this response and remain bound, but this must not be a
+      // forced rebind: forceUpdate would incorrectly reset timeout streak=1.
       expect(mocks.updateSessionBindingSmart).toHaveBeenCalledWith(
         "sess-hedge",
         1,
@@ -1334,8 +1334,9 @@ describe("ProxyForwarder - first-byte hedge scheduling", () => {
         false,
         false,
         null,
-        true
+        false
       );
+      expect(mocks.resetStickyFirstByteTimeoutStreak).not.toHaveBeenCalled();
       expect(mocks.releaseProviderSession).toHaveBeenCalledWith(2, "sess-hedge");
     } finally {
       vi.useRealTimers();

@@ -4628,16 +4628,18 @@ export class ProxyForwarder {
       if (session.sessionId) {
         void (async () => {
           const plan = session.getPriorityUpgradePlan();
-          // Cheap-test-pass rebind: force sticky onto the higher-priority provider.
-          // Otherwise keep existing hedge forceUpdate semantics for real races.
-          const forceUpdate = plan?.mode === "apply_pending_rebind" || isActualHedgeWin;
+          // Only a real provider switch (or an explicit pending rebind) may force
+          // the sticky binding and reset its timeout streak. If the original sticky
+          // wins during first-timeout soft grace, keep the binding but preserve streak=1.
+          const switchedProvider = attempt.provider.id !== initialProvider.id;
+          const forceUpdate = plan?.mode === "apply_pending_rebind" || switchedProvider;
 
           const bindingResult = await SessionManager.updateSessionBindingSmart(
             session.sessionId!,
             attempt.provider.id,
             attempt.provider.priority || 0,
             launchedProviderCount === 1 && attempt.provider.id === initialProvider.id,
-            attempt.provider.id !== initialProvider.id,
+            switchedProvider,
             session.authState?.key?.id ?? null,
             forceUpdate
           );
