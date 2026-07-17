@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const store = new Map<string, string>();
+const hashes = new Map<string, Map<string, string>>();
 
 const redis = {
   status: "ready",
@@ -14,8 +15,46 @@ const redis = {
     store.set(key, value);
     return "OK";
   }),
-  del: vi.fn(async (key: string) => (store.delete(key) ? 1 : 0)),
+  hmget: vi.fn(async (key: string, ...fields: string[]) => {
+    const hash = hashes.get(key);
+    return fields.map((field) => hash?.get(field) ?? null);
+  }),
+  del: vi.fn(async (key: string) => {
+    const removedValue = store.delete(key);
+    const removedHash = hashes.delete(key);
+    return removedValue || removedHash ? 1 : 0;
+  }),
   eval: vi.fn(async (script: string, keyCount: number, ...args: string[]) => {
+    if (script.includes("PRIORITY_UPGRADE_STREAK_UPDATE")) {
+      const [hashKey, epochKey, cancelledKey, providerId, expectedEpoch, success, firstByteMs] =
+        args;
+      if (
+        !hashKey ||
+        !epochKey ||
+        !cancelledKey ||
+        !providerId ||
+        !expectedEpoch ||
+        !success ||
+        !firstByteMs
+      ) {
+        return null;
+      }
+      if ((store.get(epochKey) ?? "0") !== expectedEpoch) return null;
+      if (store.get(cancelledKey) === "1") return null;
+      const hash = hashes.get(hashKey) ?? new Map<string, string>();
+      if (success !== "1") {
+        hash.delete(providerId);
+        if (hash.size === 0) hashes.delete(hashKey);
+        return "0:0";
+      }
+      const [countRaw = "0", totalRaw = "0"] = (hash.get(providerId) ?? "0:0").split(":");
+      const count = Number.parseInt(countRaw, 10) + 1;
+      const total = Number.parseFloat(totalRaw) + Number.parseFloat(firstByteMs);
+      const encoded = `${count}:${total.toFixed(6)}`;
+      hash.set(providerId, encoded);
+      hashes.set(hashKey, hash);
+      return encoded;
+    }
     if (keyCount === 1 && script.includes("redis.call('PEXPIRE'")) {
       const [key, ownerToken] = args;
       if (!key || !ownerToken || store.get(key) !== ownerToken) return 0;
@@ -59,18 +98,23 @@ vi.mock("@/lib/logger", () => ({
 }));
 
 import {
+  clearPriorityUpgradeProbeSuccessStates,
   PRIORITY_UPGRADE_PROBE,
   collectPriorityUpgradeProbeWindow,
   consumePendingPriorityRebind,
   createPriorityUpgradeProbeBatches,
   getPendingPriorityRebind,
+  getPriorityUpgradeProbeSuccessStates,
   isPriorityUpgradeFirstByteSlaMet,
   isPriorityUpgradeProbeEnabled,
+  prioritizePriorityUpgradeProbeCandidates,
+  recordPriorityUpgradeProbeOutcomeIfEpoch,
   refreshSessionProbeRoundLock,
   releaseProviderProbeLock,
   releaseSessionProbeRoundLock,
-  selectPriorityUpgradeProbeWinner,
+  selectPriorityUpgradeStreakWinner,
   setPendingPriorityRebindIfEpoch,
+  shouldClearPriorityUpgradeProbeSuccessStates,
   tryAcquireProviderProbeLock,
   tryAcquireSessionProbeGate,
   tryAcquireSessionProbeRoundLock,
@@ -78,6 +122,7 @@ import {
 
 beforeEach(() => {
   store.clear();
+  hashes.clear();
   redis.status = "ready";
   vi.clearAllMocks();
 });
@@ -89,6 +134,7 @@ describe("priority-upgrade probe", () => {
     expect(PRIORITY_UPGRADE_PROBE.GLOBAL_INFLIGHT_LIMIT).toBe(3);
     expect(PRIORITY_UPGRADE_PROBE.SESSION_ROUND_LOCK_MS).toBe(210_000);
     expect(PRIORITY_UPGRADE_PROBE.SESSION_ROUND_LOCK_REFRESH_MS).toBe(60_000);
+    expect(PRIORITY_UPGRADE_PROBE.REQUIRED_CONSECUTIVE_SUCCESSES).toBe(3);
   });
 
   it("fills a probe batch across priority boundaries", () => {
@@ -136,31 +182,217 @@ describe("priority-upgrade probe", () => {
     });
   });
 
-  it("chooses priority before first-byte speed in a mixed batch", () => {
-    const p1SlowPass = { provider: { id: 1, priority: 1 }, firstByteMs: 900 };
-    const p2FastPass = { provider: { id: 2, priority: 2 }, firstByteMs: 100 };
-    const p2SlowPass = { provider: { id: 3, priority: 2 }, firstByteMs: 300 };
+  it("waits for every retained result when multiple providers pass in one batch", async () => {
+    type Outcome = { id: number; state: "ok" };
+    const resolvers = new Map<number, (outcome: Outcome) => void>();
+    let settled = false;
+    const collection = collectPriorityUpgradeProbeWindow({
+      providers: [1, 2, 3],
+      startIndex: 0,
+      execute: (id) => new Promise<Outcome>((resolve) => resolvers.set(id, resolve)),
+      isDirectFailure: () => false,
+      onDirectFailure: async () => {},
+    });
+    void collection.then(() => {
+      settled = true;
+    });
 
+    resolvers.get(2)!({ id: 2, state: "ok" });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    resolvers.get(1)!({ id: 1, state: "ok" });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    resolvers.get(3)!({ id: 3, state: "ok" });
+
+    const result = await collection;
+    expect(new Set(result.outcomes.map((outcome) => outcome.id))).toEqual(new Set([1, 2, 3]));
+    expect(result.nextIndex).toBe(3);
+  });
+
+  it("rejects a success without a finite first-byte measurement", async () => {
+    const sessionId = "session-missing-first-byte";
+    store.set(`session:${sessionId}:priority_upgrade_probe_epoch`, "1");
     expect(
-      selectPriorityUpgradeProbeWinner([p2FastPass, p1SlowPass, p2SlowPass])?.provider.id
-    ).toBe(p1SlowPass.provider.id);
-    expect(selectPriorityUpgradeProbeWinner([p2SlowPass, p2FastPass])?.provider.id).toBe(
-      p2FastPass.provider.id
+      await recordPriorityUpgradeProbeOutcomeIfEpoch({
+        sessionId,
+        providerId: 99,
+        success: true,
+        expectedEpoch: 1,
+      })
+    ).toBeNull();
+    expect(await getPriorityUpgradeProbeSuccessStates(sessionId, [99])).toEqual([]);
+  });
+
+  it("keeps consecutive success progress, resets on one failure, and qualifies again at three", async () => {
+    const sessionId = "session-three-successes";
+    const providerId = 22;
+    const expectedEpoch = 7;
+    store.set(`session:${sessionId}:priority_upgrade_probe_epoch`, String(expectedEpoch));
+
+    const first = await recordPriorityUpgradeProbeOutcomeIfEpoch({
+      sessionId,
+      providerId,
+      success: true,
+      firstByteMs: 120,
+      expectedEpoch,
+    });
+    const second = await recordPriorityUpgradeProbeOutcomeIfEpoch({
+      sessionId,
+      providerId,
+      success: true,
+      firstByteMs: 180,
+      expectedEpoch,
+    });
+    expect(first?.consecutiveSuccesses).toBe(1);
+    expect(second).toMatchObject({
+      consecutiveSuccesses: 2,
+      totalFirstByteMs: 300,
+      averageFirstByteMs: 150,
+    });
+
+    const reset = await recordPriorityUpgradeProbeOutcomeIfEpoch({
+      sessionId,
+      providerId,
+      success: false,
+      expectedEpoch,
+    });
+    expect(reset?.consecutiveSuccesses).toBe(0);
+    await expect(getPriorityUpgradeProbeSuccessStates(sessionId, [providerId])).resolves.toEqual(
+      []
     );
 
-    const rawHighButGroupLow = {
-      provider: { id: 4, priority: 1 },
-      effectivePriority: 3,
-      firstByteMs: 50,
+    await recordPriorityUpgradeProbeOutcomeIfEpoch({
+      sessionId,
+      providerId,
+      success: true,
+      firstByteMs: 90,
+      expectedEpoch,
+    });
+    await recordPriorityUpgradeProbeOutcomeIfEpoch({
+      sessionId,
+      providerId,
+      success: true,
+      firstByteMs: 110,
+      expectedEpoch,
+    });
+    const third = await recordPriorityUpgradeProbeOutcomeIfEpoch({
+      sessionId,
+      providerId,
+      success: true,
+      firstByteMs: 100,
+      expectedEpoch,
+    });
+    expect(third).toMatchObject({
+      consecutiveSuccesses: 3,
+      totalFirstByteMs: 300,
+      averageFirstByteMs: 100,
+    });
+  });
+
+  it("prioritizes candidates with success progress before the frozen weighted remainder", () => {
+    const weightedPlan = [{ id: 1 }, { id: 2 }, { id: 3 }, { id: 4 }];
+    const ordered = prioritizePriorityUpgradeProbeCandidates(weightedPlan, [
+      {
+        providerId: 2,
+        consecutiveSuccesses: 1,
+        totalFirstByteMs: 80,
+        averageFirstByteMs: 80,
+      },
+      {
+        providerId: 3,
+        consecutiveSuccesses: 2,
+        totalFirstByteMs: 500,
+        averageFirstByteMs: 250,
+      },
+    ]);
+    expect(ordered.map((candidate) => candidate.id)).toEqual([3, 2, 1, 4]);
+  });
+
+  it("requires three successes and chooses the lowest average when two qualify together", () => {
+    const notQualified = {
+      provider: { id: 1 },
+      successState: {
+        providerId: 1,
+        consecutiveSuccesses: 2,
+        totalFirstByteMs: 100,
+        averageFirstByteMs: 50,
+      },
     };
-    const rawLowButGroupHigh = {
-      provider: { id: 5, priority: 3 },
-      effectivePriority: 1,
-      firstByteMs: 500,
+    const slowerAverage = {
+      provider: { id: 11 },
+      successState: {
+        providerId: 11,
+        consecutiveSuccesses: 3,
+        totalFirstByteMs: 600,
+        averageFirstByteMs: 200,
+      },
     };
+    const fasterAverage = {
+      provider: { id: 22 },
+      successState: {
+        providerId: 22,
+        consecutiveSuccesses: 3,
+        totalFirstByteMs: 450,
+        averageFirstByteMs: 150,
+      },
+    };
+    expect(selectPriorityUpgradeStreakWinner([notQualified])).toBeNull();
+    expect(selectPriorityUpgradeStreakWinner([notQualified, slowerAverage, fasterAverage])).toBe(
+      fasterAverage
+    );
+  });
+
+  it("clears progress only when the real pending target wins and binding updates", () => {
     expect(
-      selectPriorityUpgradeProbeWinner([rawHighButGroupLow, rawLowButGroupHigh])?.provider.id
-    ).toBe(rawLowButGroupHigh.provider.id);
+      shouldClearPriorityUpgradeProbeSuccessStates({
+        isPendingRebind: true,
+        bindingUpdated: true,
+        winningProviderId: 22,
+        pendingProviderId: 22,
+      })
+    ).toBe(true);
+    expect(
+      shouldClearPriorityUpgradeProbeSuccessStates({
+        isPendingRebind: true,
+        bindingUpdated: true,
+        winningProviderId: 33,
+        pendingProviderId: 22,
+      })
+    ).toBe(false);
+    expect(
+      shouldClearPriorityUpgradeProbeSuccessStates({
+        isPendingRebind: true,
+        bindingUpdated: false,
+        winningProviderId: 22,
+        pendingProviderId: 22,
+      })
+    ).toBe(false);
+  });
+
+  it("rejects stale streak updates and clears all progress only after a real rebind", async () => {
+    const sessionId = "session-stale-streak";
+    store.set(`session:${sessionId}:priority_upgrade_probe_epoch`, "9");
+    await expect(
+      recordPriorityUpgradeProbeOutcomeIfEpoch({
+        sessionId,
+        providerId: 5,
+        success: true,
+        firstByteMs: 100,
+        expectedEpoch: 8,
+      })
+    ).resolves.toBeNull();
+
+    await recordPriorityUpgradeProbeOutcomeIfEpoch({
+      sessionId,
+      providerId: 5,
+      success: true,
+      firstByteMs: 100,
+      expectedEpoch: 9,
+    });
+    await expect(getPriorityUpgradeProbeSuccessStates(sessionId, [5])).resolves.toHaveLength(1);
+    await clearPriorityUpgradeProbeSuccessStates(sessionId);
+    await expect(getPriorityUpgradeProbeSuccessStates(sessionId, [5])).resolves.toEqual([]);
   });
 
   it("allows one complete probe round per session interval", async () => {

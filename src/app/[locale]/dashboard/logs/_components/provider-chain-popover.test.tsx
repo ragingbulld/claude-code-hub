@@ -325,7 +325,8 @@ describe("provider-chain-popover priority-upgrade test marker", () => {
             id: 2,
             name: "candidate",
             reason: "priority_upgrade_probe",
-            errorMessage: "cheap_test_ok_pending_rebind_first_byte_ms=320",
+            errorMessage:
+              "cheap_test_ok_pending_rebind_streak=3/3_first_byte_ms=320_average_first_byte_ms=280",
           },
         ]}
         finalProvider="sticky"
@@ -352,7 +353,8 @@ describe("provider-chain-popover priority-upgrade test marker", () => {
         id: 3,
         name: "slower",
         reason: "priority_upgrade_probe",
-        errorMessage: "cheap_test_ok_not_selected_first_byte_ms=900",
+        errorMessage:
+          "cheap_test_ok_not_selected_streak=2/3_first_byte_ms=900_average_first_byte_ms=850",
       },
       {
         id: 4,
@@ -364,7 +366,8 @@ describe("provider-chain-popover priority-upgrade test marker", () => {
         id: 2,
         name: "winner",
         reason: "priority_upgrade_probe",
-        errorMessage: "cheap_test_ok_pending_rebind_first_byte_ms=500",
+        errorMessage:
+          "cheap_test_ok_pending_rebind_streak=3/3_first_byte_ms=500_average_first_byte_ms=470",
       },
     ]);
 

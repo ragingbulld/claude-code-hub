@@ -24,15 +24,20 @@ import { recordEndpointFailure, recordEndpointSuccess } from "@/lib/endpoint-cir
 import { applyGeminiGoogleSearchOverrideWithAudit } from "@/lib/gemini/provider-overrides";
 import { logger } from "@/lib/logger";
 import {
+  clearPriorityUpgradeProbeSuccessStates,
   collectPriorityUpgradeProbeWindow,
+  getPriorityUpgradeProbeSuccessStates,
   isPriorityUpgradeFirstByteSlaMet,
   PRIORITY_UPGRADE_PROBE,
+  prioritizePriorityUpgradeProbeCandidates,
+  recordPriorityUpgradeProbeOutcomeIfEpoch,
   refreshSessionProbeRoundLock,
   releaseProbeInflightSlot,
   releaseProviderProbeLock,
   releaseSessionProbeRoundLock,
-  selectPriorityUpgradeProbeWinner,
+  selectPriorityUpgradeStreakWinner,
   setPendingPriorityRebindIfEpoch,
+  shouldClearPriorityUpgradeProbeSuccessStates,
   tryAcquireProbeInflightSlot,
   tryAcquireProviderProbeLock,
   tryAcquireSessionProbeGate,
@@ -4761,6 +4766,17 @@ export class ProxyForwarder {
           );
 
           if (bindingResult.updated) {
+            if (
+              plan &&
+              shouldClearPriorityUpgradeProbeSuccessStates({
+                isPendingRebind: plan.mode === "apply_pending_rebind",
+                bindingUpdated: bindingResult.updated,
+                winningProviderId: attempt.provider.id,
+                pendingProviderId: plan.higherPriorityProviderId,
+              })
+            ) {
+              await clearPriorityUpgradeProbeSuccessStates(session.sessionId!);
+            }
             logger.info("ProxyForwarder: Hedge winner binding updated", {
               sessionId: session.sessionId,
               providerId: attempt.provider.id,
@@ -5077,11 +5093,7 @@ export class ProxyForwarder {
 
     const providers = (await Promise.all(uniqueIds.map((id) => findProviderById(id))))
       .filter((provider): provider is Provider => Boolean(provider?.isEnabled))
-      .sort((a, b) => {
-        const priorityDiff = (a.priority || 0) - (b.priority || 0);
-        if (priorityDiff !== 0) return priorityDiff;
-        return uniqueIds.indexOf(a.id) - uniqueIds.indexOf(b.id);
-      });
+      .sort((a, b) => uniqueIds.indexOf(a.id) - uniqueIds.indexOf(b.id));
     if (providers.length === 0) return;
     if (!session.sessionId) return;
     const sessionId = session.sessionId;
@@ -5095,7 +5107,16 @@ export class ProxyForwarder {
 
     try {
       if (!(await tryAcquireSessionProbeGate(sessionId))) return;
-      await ProxyForwarder.executePriorityUpgradeCheapTestRound(session, providers, probeEpoch);
+      const successStates = await getPriorityUpgradeProbeSuccessStates(
+        sessionId,
+        providers.map((provider) => provider.id)
+      );
+      const orderedProviders = prioritizePriorityUpgradeProbeCandidates(providers, successStates);
+      await ProxyForwarder.executePriorityUpgradeCheapTestRound(
+        session,
+        orderedProviders,
+        probeEpoch
+      );
     } finally {
       clearInterval(roundLockRefreshTimer);
       await releaseSessionProbeRoundLock(sessionId, roundLockToken);
@@ -5133,8 +5154,10 @@ export class ProxyForwarder {
     };
 
     const model = session.getCurrentModel() || session.getOriginalModel() || undefined;
+    let probeInvalidatedDuringWindow = false;
 
     const executeProbeCandidate = async (provider: Provider) => {
+      if (probeInvalidatedDuringWindow) return { provider, state: "deferred" as const };
       const providerLockToken = await tryAcquireProviderProbeLock(provider.id);
       if (!providerLockToken) return { provider, state: "deferred" as const };
 
@@ -5213,6 +5236,24 @@ export class ProxyForwarder {
           (outcome.state === "completed" && outcome.result.success === false),
         onDirectFailure: async (outcome: ProbeOutcome) => {
           if (outcome.state !== "errored" && outcome.state !== "completed") return;
+          if (!(await isProbeCurrent())) {
+            probeInvalidatedDuringWindow = true;
+            await releaseProviderProbeLock(outcome.provider.id, outcome.providerLockToken);
+            session.addProviderToChain(outcome.provider, {
+              reason: "priority_upgrade_probe",
+              selectionMethod: "priority_upgrade",
+              circuitState: getCircuitState(outcome.provider.id),
+              errorMessage: "cheap_test_discarded_hedge_race",
+            });
+            await persistProbeChain();
+            return;
+          }
+          await recordPriorityUpgradeProbeOutcomeIfEpoch({
+            sessionId: session.sessionId!,
+            providerId: outcome.provider.id,
+            success: false,
+            expectedEpoch: probeEpoch,
+          });
           await releaseProviderProbeLock(outcome.provider.id, outcome.providerLockToken);
           const firstByteMs =
             outcome.state === "completed" ? outcome.result.firstByteMs : undefined;
@@ -5223,7 +5264,7 @@ export class ProxyForwarder {
             errorMessage:
               outcome.state === "errored"
                 ? "cheap_test_error"
-                : `cheap_test_fail_status=${outcome.result.status}_first_byte_ms=${firstByteMs ?? -1}`,
+                : `cheap_test_fail_status=${outcome.result.status}_first_byte_ms=${firstByteMs ?? -1}_streak_reset=1`,
           });
           await persistProbeChain();
         },
@@ -5250,12 +5291,13 @@ export class ProxyForwarder {
         return;
       }
 
-      const probeEffectiveGroup = getEffectiveProviderGroup(session);
       const passed: Array<{
         provider: Provider;
         providerLockToken: string;
         firstByteMs: number;
-        effectivePriority: number;
+        successState: NonNullable<
+          Awaited<ReturnType<typeof recordPriorityUpgradeProbeOutcomeIfEpoch>>
+        >;
       }> = [];
       const deferredProviders: Provider[] = [];
 
@@ -5266,6 +5308,12 @@ export class ProxyForwarder {
         }
 
         if (outcome.state === "errored") {
+          await recordPriorityUpgradeProbeOutcomeIfEpoch({
+            sessionId: session.sessionId!,
+            providerId: outcome.provider.id,
+            success: false,
+            expectedEpoch: probeEpoch,
+          });
           await releaseProviderProbeLock(outcome.provider.id, outcome.providerLockToken);
           session.addProviderToChain(outcome.provider, {
             reason: "priority_upgrade_probe",
@@ -5287,46 +5335,61 @@ export class ProxyForwarder {
         const firstByteMs = result.firstByteMs;
 
         if (withinSla && firstByteMs !== undefined) {
-          passed.push({
-            provider: outcome.provider,
-            providerLockToken: outcome.providerLockToken,
+          const successState = await recordPriorityUpgradeProbeOutcomeIfEpoch({
+            sessionId: session.sessionId!,
+            providerId: outcome.provider.id,
+            success: true,
             firstByteMs,
-            effectivePriority: ProxyProviderResolver.resolveEffectivePriority(
-              outcome.provider,
-              probeEffectiveGroup
-            ),
+            expectedEpoch: probeEpoch,
           });
+          if (successState) {
+            passed.push({
+              provider: outcome.provider,
+              providerLockToken: outcome.providerLockToken,
+              firstByteMs,
+              successState,
+            });
+          } else {
+            await releaseProviderProbeLock(outcome.provider.id, outcome.providerLockToken);
+            session.addProviderToChain(outcome.provider, {
+              reason: "priority_upgrade_probe",
+              selectionMethod: "priority_upgrade",
+              circuitState: getCircuitState(outcome.provider.id),
+              errorMessage: `cheap_test_ok_not_selected_state_unavailable_first_byte_ms=${firstByteMs}`,
+            });
+            await persistProbeChain();
+          }
         } else {
+          await recordPriorityUpgradeProbeOutcomeIfEpoch({
+            sessionId: session.sessionId!,
+            providerId: outcome.provider.id,
+            success: false,
+            expectedEpoch: probeEpoch,
+          });
           await releaseProviderProbeLock(outcome.provider.id, outcome.providerLockToken);
           session.addProviderToChain(outcome.provider, {
             reason: "priority_upgrade_probe",
             selectionMethod: "priority_upgrade",
             circuitState: getCircuitState(outcome.provider.id),
-            errorMessage: `cheap_test_fail_status=${result.status}_first_byte_ms=${firstByteMs ?? -1}`,
+            errorMessage: `cheap_test_fail_status=${result.status}_first_byte_ms=${firstByteMs ?? -1}_streak_reset=1`,
           });
           await persistProbeChain();
         }
       }
 
       if (passed.length > 0) {
-        const winner = selectPriorityUpgradeProbeWinner(passed)!;
-        const winnerPriority = winner.effectivePriority;
-        const deferredHigherPriority = deferredProviders.some(
-          (provider) =>
-            ProxyProviderResolver.resolveEffectivePriority(provider, probeEffectiveGroup) <
-            winnerPriority
-        );
+        // The whole logical batch has settled. Every pass advances independently;
+        // a single pass no longer short-circuits the remaining candidates.
+        const winner = selectPriorityUpgradeStreakWinner(passed);
 
-        // Never promote a lower-priority pass while an untested higher-priority
-        // candidate in this batch is still protected by another probe/global slot.
-        if (deferredHigherPriority) {
+        if (!winner) {
           for (const candidate of passed) {
             await releaseProviderProbeLock(candidate.provider.id, candidate.providerLockToken);
             session.addProviderToChain(candidate.provider, {
               reason: "priority_upgrade_probe",
               selectionMethod: "priority_upgrade",
               circuitState: getCircuitState(candidate.provider.id),
-              errorMessage: `cheap_test_ok_not_selected_first_byte_ms=${candidate.firstByteMs}`,
+              errorMessage: `cheap_test_ok_not_selected_streak=${candidate.successState.consecutiveSuccesses}/${PRIORITY_UPGRADE_PROBE.REQUIRED_CONSECUTIVE_SUCCESSES}_first_byte_ms=${candidate.firstByteMs}_average_first_byte_ms=${Math.round(candidate.successState.averageFirstByteMs)}`,
             });
           }
           await persistProbeChain();
@@ -5360,7 +5423,7 @@ export class ProxyForwarder {
             reason: "priority_upgrade_probe",
             selectionMethod: "priority_upgrade",
             circuitState: getCircuitState(candidate.provider.id),
-            errorMessage: `cheap_test_ok_not_selected_first_byte_ms=${candidate.firstByteMs}`,
+            errorMessage: `cheap_test_ok_not_selected_streak=${candidate.successState.consecutiveSuccesses}/${PRIORITY_UPGRADE_PROBE.REQUIRED_CONSECUTIVE_SUCCESSES}_first_byte_ms=${candidate.firstByteMs}_average_first_byte_ms=${Math.round(candidate.successState.averageFirstByteMs)}`,
           });
         }
 
@@ -5368,7 +5431,7 @@ export class ProxyForwarder {
           reason: "priority_upgrade_probe",
           selectionMethod: "priority_upgrade",
           circuitState: getCircuitState(winner.provider.id),
-          errorMessage: `cheap_test_ok_pending_rebind_first_byte_ms=${winner.firstByteMs}`,
+          errorMessage: `cheap_test_ok_pending_rebind_streak=${winner.successState.consecutiveSuccesses}/${PRIORITY_UPGRADE_PROBE.REQUIRED_CONSECUTIVE_SUCCESSES}_first_byte_ms=${winner.firstByteMs}_average_first_byte_ms=${Math.round(winner.successState.averageFirstByteMs)}`,
         });
         await persistProbeChain();
         return;

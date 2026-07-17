@@ -148,8 +148,8 @@ export class ProxyProviderResolver {
     // === 会话复用 ===
     const reusedProvider = await ProxyProviderResolver.findReusable(session);
     if (reusedProvider) {
-      // Priority-upgrade: cheap-test higher priority; if it already passed, rebind
-      // next request as single-send (no parallel race with sticky).
+      // Priority-upgrade: cheap-test higher priority; after three consecutive
+      // in-SLA passes, rebind the next request as single-send (no sticky race).
       const upgrade = await ProxyProviderResolver.planPriorityUpgrade(session, reusedProvider);
       if (upgrade?.mode === "apply_pending_rebind") {
         session.setProvider(upgrade.higher);
@@ -914,8 +914,9 @@ export class ProxyProviderResolver {
       )
     );
 
-    // Every probe round receives the complete ordered set of eligible providers.
-    // There is deliberately no provider-level success marker or failure cooldown.
+    // Every probe round receives the complete frozen priority/weight plan.
+    // The forwarder moves candidates with unfinished success streaks to the front
+    // before slicing the next three-slot window; failures remain eligible but reset.
 
     // Clear only the short-lived flag before this request starts. The monotonic
     // epoch is never reset, so a concurrent/new hedge race cannot be erased.

@@ -2,9 +2,9 @@
  * Priority-upgrade probe state (cheap test gate + pending rebind).
  *
  * Goal: when sticky is on a lower-priority (often more expensive) provider,
- * cheap-test higher-priority candidates in priority/weight order. If the cheap test
- * passes, the NEXT request rebinds directly to that higher-priority provider
- * (single-send, no parallel race with the old sticky).
+ * cheap-test higher-priority candidates in priority/weight order. A candidate must
+ * pass the first-byte SLA in three consecutive rounds before the NEXT request
+ * rebinds directly to it (single-send, no parallel race with the old sticky).
  */
 import { randomUUID } from "node:crypto";
 import { logger } from "@/lib/logger";
@@ -29,6 +29,8 @@ export const PRIORITY_UPGRADE_PROBE = {
   /** Global concurrent cheap-test budget. */
   GLOBAL_INFLIGHT_LIMIT: 3,
   GLOBAL_INFLIGHT_KEY: "cch:priority_upgrade:probe_inflight",
+  /** Consecutive in-SLA probe successes required before publishing a rebind. */
+  REQUIRED_CONSECUTIVE_SUCCESSES: 3,
 } as const;
 
 function probeLockKey(providerId: number): string {
@@ -45,6 +47,213 @@ function probeEpochKey(sessionId: string): string {
 
 function probeCancelledKey(sessionId: string): string {
   return `session:${sessionId}:priority_upgrade_probe_cancelled`;
+}
+
+function probeSuccessStateKey(sessionId: string): string {
+  return `session:${sessionId}:priority_upgrade_probe_successes`;
+}
+
+export interface PriorityUpgradeProbeSuccessState {
+  providerId: number;
+  consecutiveSuccesses: number;
+  totalFirstByteMs: number;
+  averageFirstByteMs: number;
+}
+
+function parseProbeSuccessState(
+  providerId: number,
+  raw: string | null | undefined
+): PriorityUpgradeProbeSuccessState | null {
+  if (!raw) return null;
+  const [countRaw, totalRaw] = raw.split(":");
+  const consecutiveSuccesses = Number.parseInt(countRaw ?? "", 10);
+  const totalFirstByteMs = Number.parseFloat(totalRaw ?? "");
+  if (
+    !Number.isFinite(consecutiveSuccesses) ||
+    consecutiveSuccesses <= 0 ||
+    !Number.isFinite(totalFirstByteMs) ||
+    totalFirstByteMs < 0
+  ) {
+    return null;
+  }
+  return {
+    providerId,
+    consecutiveSuccesses,
+    totalFirstByteMs,
+    averageFirstByteMs: totalFirstByteMs / consecutiveSuccesses,
+  };
+}
+
+export async function getPriorityUpgradeProbeSuccessStates(
+  sessionId: string,
+  providerIds: readonly number[]
+): Promise<PriorityUpgradeProbeSuccessState[]> {
+  const ids = [...new Set(providerIds)].filter((id) => Number.isFinite(id) && id > 0);
+  if (ids.length === 0) return [];
+  const redis = getRedisClient();
+  if (redis?.status !== "ready") return [];
+  try {
+    const values = await redis.hmget(probeSuccessStateKey(sessionId), ...ids.map(String));
+    return ids
+      .map((id, index) => parseProbeSuccessState(id, values[index]))
+      .filter((state): state is PriorityUpgradeProbeSuccessState => state !== null);
+  } catch (error) {
+    logger.debug("PriorityUpgradeProbe: failed to load success streaks", {
+      sessionId,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return [];
+  }
+}
+
+/**
+ * Candidates with an unfinished success streak are tested before the remaining
+ * priority/weight plan. A candidate closer to qualification comes first; equal
+ * counts prefer the lower observed average and then preserve the frozen plan order.
+ */
+export function prioritizePriorityUpgradeProbeCandidates<T extends { id: number }>(
+  candidates: readonly T[],
+  states: readonly PriorityUpgradeProbeSuccessState[]
+): T[] {
+  const byProvider = new Map(states.map((state) => [state.providerId, state]));
+  const originalIndex = new Map(candidates.map((candidate, index) => [candidate.id, index]));
+  const progressing = candidates.filter((candidate) => byProvider.has(candidate.id));
+  progressing.sort((a, b) => {
+    const aState = byProvider.get(a.id)!;
+    const bState = byProvider.get(b.id)!;
+    return (
+      bState.consecutiveSuccesses - aState.consecutiveSuccesses ||
+      aState.averageFirstByteMs - bState.averageFirstByteMs ||
+      (originalIndex.get(a.id) ?? 0) - (originalIndex.get(b.id) ?? 0)
+    );
+  });
+  const progressingIds = new Set(progressing.map((candidate) => candidate.id));
+  return [...progressing, ...candidates.filter((candidate) => !progressingIds.has(candidate.id))];
+}
+
+/**
+ * Atomically append one in-SLA success or reset the provider streak on any failure.
+ * A real hedge race invalidates the update through the session probe epoch.
+ */
+export async function recordPriorityUpgradeProbeOutcomeIfEpoch(params: {
+  sessionId: string;
+  providerId: number;
+  success: boolean;
+  firstByteMs?: number;
+  expectedEpoch: number;
+}): Promise<PriorityUpgradeProbeSuccessState | null> {
+  const redis = getRedisClient();
+  if (redis?.status !== "ready") return null;
+  if (params.success && !Number.isFinite(params.firstByteMs)) return null;
+  try {
+    const ttl = Number.parseInt(process.env.SESSION_TTL || "300", 10);
+    const ttlSeconds = Number.isFinite(ttl) ? Math.max(1, ttl) : 300;
+    const safeFirstByteMs =
+      params.success && Number.isFinite(params.firstByteMs)
+        ? Math.max(0, params.firstByteMs ?? 0)
+        : 0;
+    const raw = await redis.eval(
+      `
+        -- PRIORITY_UPGRADE_STREAK_UPDATE
+        local current_epoch = tonumber(redis.call('GET', KEYS[2]) or '0')
+        if current_epoch ~= tonumber(ARGV[2]) then return nil end
+        if redis.call('GET', KEYS[3]) == '1' then return nil end
+        if ARGV[3] ~= '1' then
+          redis.call('HDEL', KEYS[1], ARGV[1])
+          if redis.call('HLEN', KEYS[1]) == 0 then redis.call('DEL', KEYS[1]) end
+          return '0:0'
+        end
+        local previous = redis.call('HGET', KEYS[1], ARGV[1])
+        local count = 0
+        local total = 0
+        if previous then
+          local separator = string.find(previous, ':', 1, true)
+          if separator then
+            count = tonumber(string.sub(previous, 1, separator - 1)) or 0
+            total = tonumber(string.sub(previous, separator + 1)) or 0
+          end
+        end
+        count = count + 1
+        total = total + tonumber(ARGV[4])
+        local encoded = tostring(count) .. ':' .. string.format('%.6f', total)
+        redis.call('HSET', KEYS[1], ARGV[1], encoded)
+        redis.call('EXPIRE', KEYS[1], tonumber(ARGV[5]))
+        return encoded
+      `,
+      3,
+      probeSuccessStateKey(params.sessionId),
+      probeEpochKey(params.sessionId),
+      probeCancelledKey(params.sessionId),
+      String(params.providerId),
+      String(params.expectedEpoch),
+      params.success ? "1" : "0",
+      String(safeFirstByteMs),
+      String(ttlSeconds)
+    );
+    if (typeof raw !== "string") return null;
+    if (!params.success) {
+      return {
+        providerId: params.providerId,
+        consecutiveSuccesses: 0,
+        totalFirstByteMs: 0,
+        averageFirstByteMs: 0,
+      };
+    }
+    return parseProbeSuccessState(params.providerId, raw);
+  } catch (error) {
+    logger.debug("PriorityUpgradeProbe: failed to update success streak", {
+      sessionId: params.sessionId,
+      providerId: params.providerId,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return null;
+  }
+}
+
+export async function clearPriorityUpgradeProbeSuccessStates(sessionId: string): Promise<void> {
+  const redis = getRedisClient();
+  if (redis?.status !== "ready") return;
+  try {
+    await redis.del(probeSuccessStateKey(sessionId));
+  } catch {
+    // Best effort: SESSION_TTL still bounds stale progress.
+  }
+}
+
+export function shouldClearPriorityUpgradeProbeSuccessStates(params: {
+  isPendingRebind: boolean;
+  bindingUpdated: boolean;
+  winningProviderId: number;
+  pendingProviderId: number;
+}): boolean {
+  return (
+    params.isPendingRebind &&
+    params.bindingUpdated &&
+    params.winningProviderId === params.pendingProviderId
+  );
+}
+
+export function selectPriorityUpgradeStreakWinner<
+  T extends { provider: { id: number }; successState: PriorityUpgradeProbeSuccessState },
+>(candidates: readonly T[]): T | null {
+  let winner: T | null = null;
+  for (const candidate of candidates) {
+    if (
+      candidate.successState.consecutiveSuccesses <
+      PRIORITY_UPGRADE_PROBE.REQUIRED_CONSECUTIVE_SUCCESSES
+    ) {
+      continue;
+    }
+    if (
+      !winner ||
+      candidate.successState.averageFirstByteMs < winner.successState.averageFirstByteMs ||
+      (candidate.successState.averageFirstByteMs === winner.successState.averageFirstByteMs &&
+        candidate.provider.id < winner.provider.id)
+    ) {
+      winner = candidate;
+    }
+  }
+  return winner;
 }
 
 export function isPriorityUpgradeProbeEnabled(): boolean {
@@ -121,36 +330,6 @@ export async function collectPriorityUpgradeProbeWindow<TProvider, TOutcome>(par
   }
 
   return { outcomes, nextIndex };
-}
-
-/**
- * A completed mixed-priority batch may contain faster lower-priority passes.
- * Priority wins first; first-byte speed only breaks ties inside that tier.
- */
-export function selectPriorityUpgradeProbeWinner<
-  T extends {
-    provider: { priority?: number | null };
-    firstByteMs: number;
-    effectivePriority?: number;
-  },
->(passed: readonly T[]): T | null {
-  let winner: T | null = null;
-  for (const candidate of passed) {
-    if (!winner) {
-      winner = candidate;
-      continue;
-    }
-
-    const candidatePriority = candidate.effectivePriority ?? candidate.provider.priority ?? 0;
-    const winnerPriority = winner.effectivePriority ?? winner.provider.priority ?? 0;
-    if (
-      candidatePriority < winnerPriority ||
-      (candidatePriority === winnerPriority && candidate.firstByteMs < winner.firstByteMs)
-    ) {
-      winner = candidate;
-    }
-  }
-  return winner;
 }
 
 /**
