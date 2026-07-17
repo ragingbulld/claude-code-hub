@@ -132,6 +132,41 @@ describe("priority-upgrade candidate policy parity", () => {
     expect(plan?.candidates.map((candidate) => candidate.id)).toEqual([p1a.id, p1b.id, p3.id]);
   });
 
+  test("fills a real three-provider race window across weighted priority tiers", async () => {
+    vi.spyOn(Math, "random").mockReturnValue(0);
+    const { ProxyProviderResolver } = await import("@/app/v1/_lib/proxy/provider-selector");
+    const excluded = provider({ id: 10, name: "already-launched", priority: 0 });
+    const p1Heavy = provider({ id: 1, name: "p1-heavy", priority: 1, weight: 20 });
+    const p1Light = provider({ id: 2, name: "p1-light", priority: 1, weight: 1 });
+    const p2 = provider({ id: 3, name: "p2", priority: 2, weight: 10 });
+    const p3 = provider({ id: 4, name: "p3", priority: 3, weight: 10 });
+    rateLimitMocks.RateLimitService.checkCostLimitsWithLease.mockResolvedValue({ allowed: true });
+
+    const session = {
+      sessionId: "real-race-weighted-fill",
+      originalFormat: "claude",
+      authState: null,
+      userAgent: "test-client/1.0",
+      headers: new Headers(),
+      request: { message: { metadata: null } },
+      getOriginalModel: () => "claude-test",
+      getProvidersSnapshot: async () => [excluded, p1Heavy, p1Light, p2, p3],
+    };
+
+    const candidates = await (
+      ProxyProviderResolver as unknown as {
+        selectPriorityRaceCandidates: (
+          currentSession: typeof session,
+          excludeIds: number[],
+          limit: number
+        ) => Promise<Provider[]>;
+      }
+    ).selectPriorityRaceCandidates(session, [excluded.id], 3);
+
+    expect(candidates.map((candidate) => candidate.id)).toEqual([p1Heavy.id, p1Light.id, p2.id]);
+    expect(new Set(candidates.map((candidate) => candidate.id)).size).toBe(3);
+  });
+
   test("orders same-priority probe candidates by weighted sampling without replacement", async () => {
     vi.spyOn(Math, "random")
       .mockReturnValueOnce(0.1)

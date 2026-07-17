@@ -24,7 +24,7 @@ import { recordEndpointFailure, recordEndpointSuccess } from "@/lib/endpoint-cir
 import { applyGeminiGoogleSearchOverrideWithAudit } from "@/lib/gemini/provider-overrides";
 import { logger } from "@/lib/logger";
 import {
-  createPriorityUpgradeProbeBatches,
+  collectPriorityUpgradeProbeWindow,
   isPriorityUpgradeFirstByteSlaMet,
   PRIORITY_UPGRADE_PROBE,
   refreshSessionProbeRoundLock,
@@ -112,7 +112,7 @@ import {
   syncOpenAIImageMultipartFromLogicalBody,
   validateOpenAIImageRequest,
 } from "./openai-image-compat";
-import { ProxyProviderResolver } from "./provider-selector";
+import { getEffectiveProviderGroup, ProxyProviderResolver } from "./provider-selector";
 import { finalizeHedgeLoserBilling } from "./response-handler";
 import type { ProxySession } from "./session";
 import { setDeferredStreamingFinalization } from "./stream-finalization";
@@ -223,6 +223,12 @@ type StreamingHedgeAttempt = {
   responseController: AbortController | null;
   clearResponseTimeout: (() => void) | null;
   firstByteTimeoutMs: number;
+  /** Wall-clock start used to compare first-byte latency inside one race window. */
+  startedAtMs: number;
+  /** Measured first-readable-chunk latency; null until this attempt becomes a viable pass. */
+  firstByteMs: number | null;
+  /** Rolling response-race window membership; null for the single-send sticky primary. */
+  raceWindowId: number | null;
   sequence: number;
   requestAttemptCount: number;
   reactiveRectifierRetryState: ReactiveRectifierRetryState;
@@ -262,6 +268,19 @@ type StreamingHedgeAttempt = {
     context1mApplied: boolean;
     groupCostMultiplier: number;
   } | null;
+};
+
+type StreamingHedgeRaceWindow = {
+  id: number;
+  /** Attempts still waiting for first byte / timeout / terminal error. */
+  pending: Set<StreamingHedgeAttempt>;
+  /** In-SLA responses buffered until the whole logical window can be adjudicated. */
+  passed: Set<StreamingHedgeAttempt>;
+  /** Number of non-error logical outcomes required before this window settles. */
+  targetSize: number;
+  /** Direct launch/runtime errors do not consume a slot and are replaced immediately. */
+  terminalNonErrorCount: number;
+  closed: boolean;
 };
 
 type ReactiveRectifierRetryState = {
@@ -3814,6 +3833,11 @@ export class ProxyForwarder {
     let winnerAttempt: StreamingHedgeAttempt | null = null;
     let noMoreProviders = false;
     let launchingAlternative: Promise<void> | null = null;
+    const HEDGE_WINDOW_SIZE = 3;
+    let nextRaceWindowId = 1;
+    let activeRaceWindow: StreamingHedgeRaceWindow | null = null;
+    let frozenRacePlan: Provider[] | null = null;
+    let frozenRacePlanCursor = 0;
     let lastError: Error | null = null;
     let lastErrorCategory: ErrorCategory | null = null;
     const attempts = new Set<StreamingHedgeAttempt>();
@@ -4061,6 +4085,7 @@ export class ProxyForwarder {
             streak = result.streak;
           }
 
+          const raceWindow = getAttemptRaceWindow(attempt);
           if (hardExclude) {
             attempt.hardExcluded = true;
             session.addProviderToChain(attempt.provider, {
@@ -4077,6 +4102,14 @@ export class ProxyForwarder {
             // A failed/timed-out provider is retried in the next complete round.
             // 硬杀输家。bill_hedge_losers 开启时由 abortAttempt 走后台 drain 计费。
             abortAttempt(attempt, "hedge_loser");
+            if (raceWindow) {
+              raceWindow.pending.delete(attempt);
+              raceWindow.terminalNonErrorCount += 1;
+              const committed = await resolveRaceWindowIfReady(raceWindow);
+              if (!committed && raceWindow.closed) await launchAlternative();
+            } else {
+              await launchAlternative();
+            }
           } else {
             // 软宽限：不 abort，保留时间优势，仍可成为赢家。
             session.addProviderToChain(attempt.provider, {
@@ -4086,10 +4119,10 @@ export class ProxyForwarder {
               circuitState: getCircuitState(attempt.provider.id),
               errorMessage: `first_byte_timeout_soft_grace_streak_${streak || 1}`,
             });
+            await launchAlternative();
           }
 
-          void launchAlternative();
-          void finishIfExhausted();
+          await finishIfExhausted();
         })();
         attempt.thresholdDecision = decision;
         void decision.finally(() => {
@@ -4103,6 +4136,48 @@ export class ProxyForwarder {
         if (winner && attempt === winner) continue;
         abortAttempt(attempt, reason);
       }
+    };
+
+    const getAttemptRaceWindow = (
+      attempt: StreamingHedgeAttempt
+    ): StreamingHedgeRaceWindow | null => {
+      const window = activeRaceWindow;
+      return window && !window.closed && attempt.raceWindowId === window.id ? window : null;
+    };
+
+    const resolveRaceWindowIfReady = async (window: StreamingHedgeRaceWindow): Promise<boolean> => {
+      if (window.closed || window.pending.size > 0) return false;
+      if (window.terminalNonErrorCount < window.targetSize) return false;
+
+      window.closed = true;
+      if (activeRaceWindow?.id === window.id) activeRaceWindow = null;
+
+      const passed = Array.from(window.passed).filter(
+        (attempt) =>
+          !attempt.settled &&
+          !attempt.hardExcluded &&
+          attempt.firstChunk != null &&
+          attempt.firstByteMs != null
+      );
+
+      if (passed.length > 0) {
+        const effectiveGroup = getEffectiveProviderGroup(session);
+        passed.sort((a, b) => {
+          const priorityDiff =
+            ProxyProviderResolver.resolveEffectivePriority(a.provider, effectiveGroup) -
+            ProxyProviderResolver.resolveEffectivePriority(b.provider, effectiveGroup);
+          if (priorityDiff !== 0) return priorityDiff;
+          return (
+            (a.firstByteMs ?? Number.POSITIVE_INFINITY) -
+            (b.firstByteMs ?? Number.POSITIVE_INFINITY)
+          );
+        });
+        const winner = passed[0];
+        await finalizeWinner(winner, winner.firstChunk!);
+        return true;
+      }
+
+      return false;
     };
 
     const finishIfExhausted = async () => {
@@ -4119,12 +4194,12 @@ export class ProxyForwarder {
     };
 
     /**
-     * Launch the next hedge batch: all remaining candidates at the best (lowest)
-     * remaining priority tier, highest-priority first. Same rule for cold-start
-     * cascade and sticky/timeout-triggered cascade.
+     * Fill the current three-slot response-race window from the complete ordered
+     * provider plan. Sparse priority tiers are topped up from lower tiers. A direct
+     * launch/runtime error leaves a vacancy and calls this again immediately.
      */
     const launchAlternative = async () => {
-      if (settled || winnerCommitted || noMoreProviders) return;
+      if (settled || winnerCommitted) return;
       if (launchingAlternative) {
         await launchingAlternative;
         return;
@@ -4133,60 +4208,84 @@ export class ProxyForwarder {
       launchingAlternative = (async () => {
         await cancelPriorityUpgradeProbe();
 
-        while (!settled && !winnerCommitted && !noMoreProviders) {
-          // Batch-by-batch: do not descend to a lower priority while any peer in the
-          // current race is still inside its first-byte window.
-          const stillRacingWithinSla = Array.from(attempts).some(
-            (a) => !a.settled && !a.hardExcluded && !a.thresholdTriggered
-          );
-          if (stillRacingWithinSla) {
-            return;
+        let window = activeRaceWindow;
+        if (!window || window.closed) {
+          if (noMoreProviders) return;
+          window = {
+            id: nextRaceWindowId++,
+            pending: new Set(),
+            passed: new Set(),
+            targetSize: HEDGE_WINDOW_SIZE,
+            terminalNonErrorCount: 0,
+            closed: false,
+          };
+          activeRaceWindow = window;
+        }
+
+        while (!settled && !winnerCommitted && !window.closed) {
+          const occupied = window.terminalNonErrorCount + window.pending.size;
+          const vacancies = window.targetSize - occupied;
+          if (vacancies <= 0) break;
+
+          if (!frozenRacePlan) {
+            frozenRacePlan = await ProxyProviderResolver.buildPriorityRacePlan(session, [
+              initialProvider.id,
+              ...Array.from(launchedProviderIds),
+            ]);
+            frozenRacePlanCursor = 0;
           }
-
-          const batch = await ProxyProviderResolver.selectPriorityTierCandidates(
-            session,
-            Array.from(launchedProviderIds)
+          const candidates = frozenRacePlan.slice(
+            frozenRacePlanCursor,
+            frozenRacePlanCursor + vacancies
           );
+          frozenRacePlanCursor += candidates.length;
+          const planExhaustedAfterSelection = frozenRacePlanCursor >= frozenRacePlan.length;
 
-          if (!batch || batch.length === 0) {
+          if (candidates.length === 0) {
             noMoreProviders = true;
-            if (attempts.size === 0) {
-              await finishIfExhausted();
-            }
-            return;
+            window.targetSize = occupied;
+            break;
           }
 
-          // Cap per-tier fan-out so one huge tier cannot stampede upstream.
-          const MAX_TIER_BATCH = 5;
-          const tierBatch = batch.slice(0, MAX_TIER_BATCH);
-          const tierPriority =
-            ProxyProviderResolver.resolveEffectivePriority(tierBatch[0], null) ??
-            tierBatch[0]?.priority ??
-            0;
-
-          session.addProviderToChain(tierBatch[0], {
+          const priorities = [
+            ...new Set(
+              candidates.map((provider) =>
+                ProxyProviderResolver.resolveEffectivePriority(
+                  provider,
+                  session.authState?.key?.providerGroup ||
+                    session.authState?.user?.providerGroup ||
+                    null
+                )
+              )
+            ),
+          ];
+          session.addProviderToChain(candidates[0], {
             reason: "hedge_batch_launched",
             attemptNumber: launchedProviderCount + 1,
-            circuitState: getCircuitState(tierBatch[0].id),
-            errorMessage: `priority=${tierPriority};batch_size=${tierBatch.length}`,
+            circuitState: getCircuitState(candidates[0].id),
+            errorMessage: `priorities=${priorities.join(",")};batch_size=${candidates.length};window=${window.id}`,
           });
 
           const launchResults = await Promise.all(
-            tierBatch.map((provider) => startAttempt(provider, false))
+            candidates.map((provider) => startAttempt(provider, false, window))
           );
-          const launchedAny = launchResults.some(Boolean);
+          const launchedCount = launchResults.filter(Boolean).length;
 
-          // One tier per launchAlternative call. Further tiers wait for the next
-          // first-byte timeout of this batch (or hard failure).
-          if (launchedAny) return;
-
-          // Entire tier failed to start — drop to next tier immediately.
+          if (launchedCount === 0) continue;
+          if (planExhaustedAfterSelection) {
+            // The frozen plan is exhausted; shrink around any preflight failures.
+            noMoreProviders = true;
+            window.targetSize = window.terminalNonErrorCount + window.pending.size;
+            break;
+          }
         }
+
+        await resolveRaceWindowIfReady(window);
       })()
         .catch(async (error) => {
           const normalizedError = error instanceof Error ? error : new Error(String(error));
 
-          logger.error("ProxyForwarder: Hedge failed to launch alternative provider", {
+          logger.error("ProxyForwarder: Hedge failed to fill response-race window", {
             error: normalizedError,
             sessionId: session.sessionId ?? null,
             providerId: initialProvider.id,
@@ -4462,6 +4561,7 @@ export class ProxyForwarder {
         });
       }
 
+      const raceWindow = getAttemptRaceWindow(attempt);
       attempt.settled = true;
       if (attempt.thresholdTimer) {
         clearTimeout(attempt.thresholdTimer);
@@ -4510,11 +4610,27 @@ export class ProxyForwarder {
         return;
       }
 
+      if (raceWindow) {
+        // A direct provider/runtime error does not consume a logical race slot.
+        // Remove it from the pending set and refill immediately while peers continue.
+        raceWindow.pending.delete(attempt);
+      }
       await launchAlternative();
+      if (raceWindow) {
+        // If the ordered plan is exhausted, the failed slot can no longer be
+        // replaced and must be removed from this window's completion target.
+        if (noMoreProviders) {
+          raceWindow.targetSize = Math.min(
+            raceWindow.targetSize,
+            raceWindow.terminalNonErrorCount + raceWindow.pending.size
+          );
+        }
+        await resolveRaceWindowIfReady(raceWindow);
+      }
       await finishIfExhausted();
     };
 
-    const commitWinner = async (attempt: StreamingHedgeAttempt, firstChunk: Uint8Array) => {
+    const finalizeWinner = async (attempt: StreamingHedgeAttempt, firstChunk: Uint8Array) => {
       // The SLA timer may be awaiting Redis to decide first-soft vs second-hard.
       // Do not let a first chunk commit through that decision window.
       if (attempt.thresholdDecision) {
@@ -4694,9 +4810,43 @@ export class ProxyForwarder {
       settleSuccess(response);
     };
 
+    const commitWinner = async (attempt: StreamingHedgeAttempt, firstChunk: Uint8Array) => {
+      if (attempt.thresholdDecision) await attempt.thresholdDecision;
+      if (
+        settled ||
+        winnerCommitted ||
+        attempt.settled ||
+        attempt.hardExcluded ||
+        !attempt.response ||
+        !attempt.reader
+      ) {
+        return;
+      }
+
+      const raceWindow = getAttemptRaceWindow(attempt);
+      if (!raceWindow) {
+        // Single-send sticky/pending requests retain the existing behavior, including
+        // the first sticky timeout's soft-grace ability to win late.
+        await finalizeWinner(attempt, firstChunk);
+        return;
+      }
+
+      if (attempt.thresholdTriggered) return;
+      if (attempt.thresholdTimer) {
+        clearTimeout(attempt.thresholdTimer);
+        attempt.thresholdTimer = null;
+      }
+      attempt.firstByteMs = Math.max(0, Date.now() - attempt.startedAtMs);
+      raceWindow.pending.delete(attempt);
+      raceWindow.passed.add(attempt);
+      raceWindow.terminalNonErrorCount += 1;
+      await resolveRaceWindowIfReady(raceWindow);
+    };
+
     const startAttempt = async (
       provider: Provider,
-      useOriginalSession: boolean
+      useOriginalSession: boolean,
+      raceWindow: StreamingHedgeRaceWindow | null = null
     ): Promise<boolean> => {
       if (settled || winnerCommitted || noMoreProviders || launchedProviderIds.has(provider.id)) {
         return false;
@@ -4763,6 +4913,9 @@ export class ProxyForwarder {
         clearResponseTimeout: null,
         firstByteTimeoutMs:
           provider.firstByteTimeoutStreamingMs > 0 ? provider.firstByteTimeoutStreamingMs : 0,
+        startedAtMs: Date.now(),
+        firstByteMs: null,
+        raceWindowId: raceWindow?.id ?? null,
         sequence: reservedSequence,
         requestAttemptCount: 1,
         reactiveRectifierRetryState: {
@@ -4789,6 +4942,7 @@ export class ProxyForwarder {
       };
 
       attempts.add(attempt);
+      raceWindow?.pending.add(attempt);
 
       // Record hedge participant launch in decision chain
       // (first provider is already recorded via initial_selection or session_reuse)
@@ -4854,41 +5008,50 @@ export class ProxyForwarder {
         return;
       }
 
-      // Cold start: race the entire top priority tier (same rule as timeout cascade).
-      const topTier = (await ProxyProviderResolver.selectPriorityTierCandidates(session, [])) ?? [];
-      const MAX_INITIAL_BATCH = 5;
-      const ordered = topTier.filter((p) => p.id !== initialProvider.id);
-      const batchProviders: Provider[] = [initialProvider, ...ordered].slice(0, MAX_INITIAL_BATCH);
+      // Cold start: the weighted-selected primary is the first draw. Resolve the
+      // other two slots before preflight, then start all of them concurrently so a
+      // slow endpoint lookup cannot serialize the response-race window.
+      const window: StreamingHedgeRaceWindow = {
+        id: nextRaceWindowId++,
+        pending: new Set(),
+        passed: new Set(),
+        targetSize: HEDGE_WINDOW_SIZE,
+        terminalNonErrorCount: 0,
+        closed: false,
+      };
+      activeRaceWindow = window;
 
-      if (batchProviders.length <= 1) {
-        const initialLaunched = await startAttempt(initialProvider, true);
-        if (!initialLaunched) {
-          await launchAlternative();
-        }
+      let extraCandidates: Provider[];
+      try {
+        frozenRacePlan = await ProxyProviderResolver.buildPriorityRacePlan(session, [
+          initialProvider.id,
+        ]);
+        frozenRacePlanCursor = 0;
+        extraCandidates = frozenRacePlan.slice(0, HEDGE_WINDOW_SIZE - 1);
+        frozenRacePlanCursor = extraCandidates.length;
+      } catch (error) {
+        throw ProxyForwarder.buildAllProvidersUnavailableError(
+          error instanceof Error ? error : new Error(String(error))
+        );
+      }
+      const plannedProviders = [initialProvider, ...extraCandidates];
+      const launchResults = await Promise.all(
+        plannedProviders.map((provider, index) => startAttempt(provider, index === 0, window))
+      );
+      const launchedCount = launchResults.filter(Boolean).length;
+
+      if (frozenRacePlanCursor >= (frozenRacePlan?.length ?? 0)) {
+        noMoreProviders = true;
+        window.targetSize = launchedCount;
+      }
+
+      if (launchedCount === 0) {
+        activeRaceWindow = null;
+        await launchAlternative();
         return;
       }
 
-      const tierPriority = initialProvider.priority || 0;
-      session.addProviderToChain(initialProvider, {
-        reason: "hedge_batch_launched",
-        attemptNumber: 0,
-        circuitState: getCircuitState(initialProvider.id),
-        errorMessage: `priority=${tierPriority};batch_size=${batchProviders.length}`,
-      });
-
-      // 初始供应商必须用原 session；其余用 shadow session。所有同档成员
-      // 同时进入异步 preflight，避免 endpoint/concurrency 解析造成先后手。
-      const launchResults = await Promise.all(
-        batchProviders.map((provider, index) => {
-          if (index > 0 && (provider.firstByteTimeoutStreamingMs ?? 0) <= 0) {
-            return Promise.resolve(false);
-          }
-          return startAttempt(provider, index === 0);
-        })
-      );
-      if (!launchResults.some(Boolean)) {
-        await launchAlternative();
-      }
+      await launchAlternative();
     };
 
     try {
@@ -4970,76 +5133,103 @@ export class ProxyForwarder {
     };
 
     const model = session.getCurrentModel() || session.getOriginalModel() || undefined;
-    const batches = createPriorityUpgradeProbeBatches(providers);
 
-    // Fill each bounded batch from the complete priority/weight-ordered plan.
-    // Lower-priority probes may run early to use spare slots, but can never win
-    // until every higher-priority candidate in the same batch has completed.
-    for (const batch of batches) {
+    const executeProbeCandidate = async (provider: Provider) => {
+      const providerLockToken = await tryAcquireProviderProbeLock(provider.id);
+      if (!providerLockToken) return { provider, state: "deferred" as const };
+
+      const inflightToken = await tryAcquireProbeInflightSlot();
+      if (!inflightToken) {
+        await releaseProviderProbeLock(provider.id, providerLockToken);
+        return { provider, state: "deferred" as const };
+      }
+
+      session.addProviderToChain(provider, {
+        reason: "priority_upgrade_probe",
+        selectionMethod: "priority_upgrade",
+        circuitState: getCircuitState(provider.id),
+        errorMessage: "cheap_test_start",
+      });
+      await persistProbeChain();
+
+      const timeoutMs =
+        provider.firstByteTimeoutStreamingMs > 0
+          ? provider.firstByteTimeoutStreamingMs
+          : PRIORITY_UPGRADE_PROBE.DEFAULT_TIMEOUT_MS;
+      const totalTimeoutMs = Math.min(
+        PRIORITY_UPGRADE_PROBE.PROVIDER_LOCK_MS - 5_000,
+        timeoutMs + 30_000
+      );
+
+      const providerApiCredential = provider.key;
+      try {
+        const result = await executeProviderTest({
+          providerId: String(provider.id),
+          providerUrl: provider.url,
+          apiKey: providerApiCredential,
+          providerType: provider.providerType,
+          model: model || undefined,
+          proxyUrl: provider.proxyUrl ?? undefined,
+          proxyFallbackToDirect: provider.proxyFallbackToDirect,
+          customHeaders: provider.customHeaders ?? undefined,
+          timeoutMs: totalTimeoutMs,
+          firstByteTimeoutMs: timeoutMs,
+          latencyThresholdMs: timeoutMs,
+        });
+        return {
+          provider,
+          providerLockToken,
+          state: "completed" as const,
+          result,
+          timeoutMs,
+        };
+      } catch (error) {
+        return {
+          provider,
+          providerLockToken,
+          state: "errored" as const,
+          error,
+          timeoutMs,
+        };
+      } finally {
+        await releaseProbeInflightSlot(inflightToken);
+      }
+    };
+
+    type ProbeOutcome = Awaited<ReturnType<typeof executeProbeCandidate>>;
+    let nextProviderIndex = 0;
+
+    // A logical window retains successful/SLA-timeout outcomes, but direct errors
+    // release their slot immediately and pull the next ordered candidate forward.
+    while (nextProviderIndex < providers.length) {
       if (!(await isProbeCurrent())) return;
 
-      const outcomes = await Promise.all(
-        batch.map(async (provider) => {
-          const providerLockToken = await tryAcquireProviderProbeLock(provider.id);
-          if (!providerLockToken) return { provider, state: "deferred" as const };
-
-          const inflightToken = await tryAcquireProbeInflightSlot();
-          if (!inflightToken) {
-            await releaseProviderProbeLock(provider.id, providerLockToken);
-            return { provider, state: "deferred" as const };
-          }
-
-          session.addProviderToChain(provider, {
+      const collected = await collectPriorityUpgradeProbeWindow({
+        providers,
+        startIndex: nextProviderIndex,
+        execute: executeProbeCandidate,
+        isDirectFailure: (outcome: ProbeOutcome) =>
+          outcome.state === "errored" ||
+          (outcome.state === "completed" && outcome.result.success === false),
+        onDirectFailure: async (outcome: ProbeOutcome) => {
+          if (outcome.state !== "errored" && outcome.state !== "completed") return;
+          await releaseProviderProbeLock(outcome.provider.id, outcome.providerLockToken);
+          const firstByteMs =
+            outcome.state === "completed" ? outcome.result.firstByteMs : undefined;
+          session.addProviderToChain(outcome.provider, {
             reason: "priority_upgrade_probe",
             selectionMethod: "priority_upgrade",
-            circuitState: getCircuitState(provider.id),
-            errorMessage: "cheap_test_start",
+            circuitState: getCircuitState(outcome.provider.id),
+            errorMessage:
+              outcome.state === "errored"
+                ? "cheap_test_error"
+                : `cheap_test_fail_status=${outcome.result.status}_first_byte_ms=${firstByteMs ?? -1}`,
           });
           await persistProbeChain();
-
-          const timeoutMs =
-            provider.firstByteTimeoutStreamingMs > 0
-              ? provider.firstByteTimeoutStreamingMs
-              : PRIORITY_UPGRADE_PROBE.DEFAULT_TIMEOUT_MS;
-          const totalTimeoutMs = Math.min(
-            PRIORITY_UPGRADE_PROBE.PROVIDER_LOCK_MS - 5_000,
-            timeoutMs + 30_000
-          );
-
-          try {
-            const result = await executeProviderTest({
-              providerId: String(provider.id),
-              providerUrl: provider.url,
-              apiKey: provider.key,
-              providerType: provider.providerType,
-              model: model || undefined,
-              proxyUrl: provider.proxyUrl ?? undefined,
-              proxyFallbackToDirect: provider.proxyFallbackToDirect,
-              customHeaders: provider.customHeaders ?? undefined,
-              timeoutMs: totalTimeoutMs,
-              firstByteTimeoutMs: timeoutMs,
-              latencyThresholdMs: timeoutMs,
-            });
-            return {
-              provider,
-              providerLockToken,
-              state: "completed" as const,
-              result,
-              timeoutMs,
-            };
-          } catch (error) {
-            return {
-              provider,
-              providerLockToken,
-              state: "errored" as const,
-              error,
-              timeoutMs,
-            };
-          } finally {
-            await releaseProbeInflightSlot(inflightToken);
-          }
-        })
-      );
+        },
+      });
+      nextProviderIndex = collected.nextIndex;
+      const outcomes = collected.outcomes;
 
       if (!(await isProbeCurrent())) {
         for (const outcome of outcomes) {
@@ -5060,10 +5250,12 @@ export class ProxyForwarder {
         return;
       }
 
+      const probeEffectiveGroup = getEffectiveProviderGroup(session);
       const passed: Array<{
         provider: Provider;
         providerLockToken: string;
         firstByteMs: number;
+        effectivePriority: number;
       }> = [];
       const deferredProviders: Provider[] = [];
 
@@ -5099,6 +5291,10 @@ export class ProxyForwarder {
             provider: outcome.provider,
             providerLockToken: outcome.providerLockToken,
             firstByteMs,
+            effectivePriority: ProxyProviderResolver.resolveEffectivePriority(
+              outcome.provider,
+              probeEffectiveGroup
+            ),
           });
         } else {
           await releaseProviderProbeLock(outcome.provider.id, outcome.providerLockToken);
@@ -5114,9 +5310,11 @@ export class ProxyForwarder {
 
       if (passed.length > 0) {
         const winner = selectPriorityUpgradeProbeWinner(passed)!;
-        const winnerPriority = winner.provider.priority || 0;
+        const winnerPriority = winner.effectivePriority;
         const deferredHigherPriority = deferredProviders.some(
-          (provider) => (provider.priority || 0) < winnerPriority
+          (provider) =>
+            ProxyProviderResolver.resolveEffectivePriority(provider, probeEffectiveGroup) <
+            winnerPriority
         );
 
         // Never promote a lower-priority pass while an untested higher-priority

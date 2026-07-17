@@ -74,11 +74,65 @@ export function createPriorityUpgradeProbeBatches<T>(
 }
 
 /**
+ * Collect one logical probe window. Retained outcomes (pass or SLA timeout) consume
+ * one of the three slots; direct terminal failures are reported immediately and
+ * replaced from the ordered plan without exceeding the concurrency limit.
+ */
+export async function collectPriorityUpgradeProbeWindow<TProvider, TOutcome>(params: {
+  providers: readonly TProvider[];
+  startIndex: number;
+  execute: (provider: TProvider) => Promise<TOutcome>;
+  isDirectFailure: (outcome: TOutcome) => boolean;
+  onDirectFailure: (outcome: TOutcome) => Promise<void>;
+  windowSize?: number;
+}): Promise<{ outcomes: TOutcome[]; nextIndex: number }> {
+  const windowSize = Math.max(
+    1,
+    Math.floor(params.windowSize ?? PRIORITY_UPGRADE_PROBE.GLOBAL_INFLIGHT_LIMIT)
+  );
+  const outcomes: TOutcome[] = [];
+  const pending = new Set<Promise<TOutcome>>();
+  let nextIndex = Math.max(0, Math.floor(params.startIndex));
+
+  const launchOne = () => {
+    if (nextIndex >= params.providers.length) return;
+    pending.add(params.execute(params.providers[nextIndex++]));
+  };
+
+  while (
+    outcomes.length < windowSize &&
+    (pending.size > 0 || nextIndex < params.providers.length)
+  ) {
+    while (pending.size < windowSize - outcomes.length && nextIndex < params.providers.length) {
+      launchOne();
+    }
+    if (pending.size === 0) break;
+
+    const settled = await Promise.race(
+      Array.from(pending).map(async (promise) => ({ promise, outcome: await promise }))
+    );
+    pending.delete(settled.promise);
+
+    if (params.isDirectFailure(settled.outcome)) {
+      await params.onDirectFailure(settled.outcome);
+      continue;
+    }
+    outcomes.push(settled.outcome);
+  }
+
+  return { outcomes, nextIndex };
+}
+
+/**
  * A completed mixed-priority batch may contain faster lower-priority passes.
  * Priority wins first; first-byte speed only breaks ties inside that tier.
  */
 export function selectPriorityUpgradeProbeWinner<
-  T extends { provider: { priority?: number | null }; firstByteMs: number },
+  T extends {
+    provider: { priority?: number | null };
+    firstByteMs: number;
+    effectivePriority?: number;
+  },
 >(passed: readonly T[]): T | null {
   let winner: T | null = null;
   for (const candidate of passed) {
@@ -87,8 +141,8 @@ export function selectPriorityUpgradeProbeWinner<
       continue;
     }
 
-    const candidatePriority = candidate.provider.priority || 0;
-    const winnerPriority = winner.provider.priority || 0;
+    const candidatePriority = candidate.effectivePriority ?? candidate.provider.priority ?? 0;
+    const winnerPriority = winner.effectivePriority ?? winner.provider.priority ?? 0;
     if (
       candidatePriority < winnerPriority ||
       (candidatePriority === winnerPriority && candidate.firstByteMs < winner.firstByteMs)

@@ -4,12 +4,22 @@ import { resolveEndpointPolicy } from "@/app/v1/_lib/proxy/endpoint-policy";
 const mocks = vi.hoisted(() => ({
   pickRandomProviderWithExclusion: vi.fn(),
   resolveEffectivePriority: vi.fn((provider: { priority?: number }) => provider.priority ?? 0),
-  selectPriorityTierCandidates: vi.fn((session: unknown, excludeIds: number[] = []) => {
+  selectPriorityTierCandidates: vi.fn(async (session: unknown, excludeIds: number[] = []) => {
     if (excludeIds.length === 0) return [];
-    return mocks
-      .pickRandomProviderWithExclusion(session, excludeIds)
-      .then((candidate: unknown) => (candidate ? [candidate] : []));
+    const candidate = await mocks.pickRandomProviderWithExclusion(session, excludeIds);
+    return candidate ? [candidate] : [];
   }),
+  selectPriorityRaceCandidates: vi.fn(
+    async (session: unknown, excludeIds: number[] = [], limit = 3) => {
+      const tier = (await mocks.selectPriorityTierCandidates(session, excludeIds)) as Array<{
+        id: number;
+      }>;
+      return tier.slice(0, limit);
+    }
+  ),
+  buildPriorityRacePlan: vi.fn((session: unknown, excludeIds: number[] = []) =>
+    mocks.selectPriorityRaceCandidates(session, excludeIds, Number.MAX_SAFE_INTEGER)
+  ),
   recordSuccess: vi.fn(),
   recordFailure: vi.fn(async () => {}),
   getCircuitState: vi.fn(() => "closed"),
@@ -120,10 +130,13 @@ vi.mock("@/lib/session-manager", () => ({
 }));
 
 vi.mock("@/app/v1/_lib/proxy/provider-selector", () => ({
+  getEffectiveProviderGroup: vi.fn(() => null),
   ProxyProviderResolver: {
     pickRandomProviderWithExclusion: mocks.pickRandomProviderWithExclusion,
     resolveEffectivePriority: mocks.resolveEffectivePriority,
     selectPriorityTierCandidates: mocks.selectPriorityTierCandidates,
+    selectPriorityRaceCandidates: mocks.selectPriorityRaceCandidates,
+    buildPriorityRacePlan: mocks.buildPriorityRacePlan,
   },
 }));
 
@@ -373,6 +386,24 @@ function withThinkingBlocks(session: ProxySession): void {
 describe("ProxyForwarder - first-byte hedge scheduling", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mocks.selectPriorityTierCandidates.mockImplementation(
+      async (session: unknown, excludeIds: number[] = []) => {
+        if (excludeIds.length === 0) return [];
+        const candidate = await mocks.pickRandomProviderWithExclusion(session, excludeIds);
+        return candidate ? [candidate] : [];
+      }
+    );
+    mocks.selectPriorityRaceCandidates.mockImplementation(
+      async (session: unknown, excludeIds: number[] = [], limit = 3) => {
+        const tier = (await mocks.selectPriorityTierCandidates(session, excludeIds)) as Array<{
+          id: number;
+        }>;
+        return tier.slice(0, limit);
+      }
+    );
+    mocks.buildPriorityRacePlan.mockImplementation((session: unknown, excludeIds: number[] = []) =>
+      mocks.selectPriorityRaceCandidates(session, excludeIds, Number.MAX_SAFE_INTEGER)
+    );
     mocks.checkAndTrackProviderSession.mockResolvedValue({
       allowed: true,
       count: 1,
@@ -1049,9 +1080,7 @@ describe("ProxyForwarder - first-byte hedge scheduling", () => {
       const session = createSession();
       setProviderWithSessionRef(session, provider1);
 
-      mocks.pickRandomProviderWithExclusion
-        .mockResolvedValueOnce(provider2)
-        .mockResolvedValueOnce(provider3);
+      mocks.selectPriorityRaceCandidates.mockResolvedValueOnce([provider2, provider3]);
       mocks.checkAndTrackProviderSession
         .mockResolvedValueOnce({
           allowed: false,
@@ -1409,6 +1438,180 @@ describe("ProxyForwarder - first-byte hedge scheduling", () => {
     }
   });
 
+  test("cold-start mixed priorities wait one window and choose the highest-priority SLA pass", async () => {
+    vi.useFakeTimers();
+
+    try {
+      const high = createProvider({
+        id: 11,
+        name: "high-priority",
+        priority: 0,
+        firstByteTimeoutStreamingMs: 100,
+      });
+      const middle = createProvider({
+        id: 22,
+        name: "middle-priority",
+        priority: 1,
+        firstByteTimeoutStreamingMs: 100,
+      });
+      const low = createProvider({
+        id: 33,
+        name: "low-priority",
+        priority: 2,
+        firstByteTimeoutStreamingMs: 100,
+      });
+      const session = createSession();
+      session.setProvider(high);
+      mocks.selectPriorityRaceCandidates.mockResolvedValueOnce([middle, low]);
+
+      const doForward = vi.spyOn(
+        ProxyForwarder as unknown as {
+          doForward: (...args: unknown[]) => Promise<Response>;
+        },
+        "doForward"
+      );
+      const delays = new Map([
+        [high.id, 80],
+        [middle.id, 45],
+        [low.id, 20],
+      ]);
+      doForward.mockImplementation(async (attemptSession, providerValue) => {
+        const provider = providerValue as Provider;
+        const runtime = attemptSession as ProxySession & AttemptRuntime;
+        const controller = new AbortController();
+        runtime.responseController = controller;
+        runtime.clearResponseTimeout = vi.fn();
+        return createStreamingResponse({
+          label: provider.name,
+          firstChunkDelayMs: delays.get(provider.id)!,
+          controller,
+        });
+      });
+
+      const responsePromise = ProxyForwarder.send(session);
+      await flushHedgeSelection();
+      await waitForCallCount(doForward, 3);
+      await vi.advanceTimersByTimeAsync(25);
+      await flushHedgeSelection();
+      expect(session.provider?.id).toBe(high.id);
+
+      await vi.advanceTimersByTimeAsync(60);
+      const response = await responsePromise;
+      expect(await response.text()).toContain('"provider":"high-priority"');
+      expect(session.provider?.id).toBe(high.id);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("same-priority response race chooses the lowest first-byte latency", async () => {
+    vi.useFakeTimers();
+
+    try {
+      const slow = createProvider({ id: 41, name: "same-slow", priority: 0 });
+      const fast = createProvider({ id: 42, name: "same-fast", priority: 0 });
+      const medium = createProvider({ id: 43, name: "same-medium", priority: 0 });
+      const session = createSession();
+      session.setProvider(slow);
+      mocks.selectPriorityRaceCandidates.mockResolvedValueOnce([fast, medium]);
+
+      const doForward = vi.spyOn(
+        ProxyForwarder as unknown as {
+          doForward: (...args: unknown[]) => Promise<Response>;
+        },
+        "doForward"
+      );
+      const delays = new Map([
+        [slow.id, 80],
+        [fast.id, 20],
+        [medium.id, 50],
+      ]);
+      doForward.mockImplementation(async (attemptSession, providerValue) => {
+        const provider = providerValue as Provider;
+        const runtime = attemptSession as ProxySession & AttemptRuntime;
+        const controller = new AbortController();
+        runtime.responseController = controller;
+        runtime.clearResponseTimeout = vi.fn();
+        return createStreamingResponse({
+          label: provider.name,
+          firstChunkDelayMs: delays.get(provider.id)!,
+          controller,
+        });
+      });
+
+      const responsePromise = ProxyForwarder.send(session);
+      await flushHedgeSelection();
+      await waitForCallCount(doForward, 3);
+      await vi.advanceTimersByTimeAsync(85);
+      const response = await responsePromise;
+      expect(await response.text()).toContain('"provider":"same-fast"');
+      expect(session.provider?.id).toBe(fast.id);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("direct provider error refills the live three-slot response-race window", async () => {
+    vi.useFakeTimers();
+
+    try {
+      const first = createProvider({ id: 51, name: "window-first", priority: 0 });
+      const broken = createProvider({ id: 52, name: "window-broken", priority: 0 });
+      const third = createProvider({ id: 53, name: "window-third", priority: 0 });
+      const refill = createProvider({ id: 54, name: "window-refill", priority: 0 });
+      const session = createSession();
+      session.setProvider(first);
+      mocks.buildPriorityRacePlan.mockResolvedValueOnce([broken, third, refill]);
+      mocks.categorizeErrorAsync.mockResolvedValue(ProxyErrorCategory.PROVIDER_ERROR);
+
+      const doForward = vi.spyOn(
+        ProxyForwarder as unknown as {
+          doForward: (...args: unknown[]) => Promise<Response>;
+        },
+        "doForward"
+      );
+      doForward.mockImplementation(async (attemptSession, providerValue) => {
+        const provider = providerValue as Provider;
+        const runtime = attemptSession as ProxySession & AttemptRuntime;
+        const controller = new AbortController();
+        runtime.responseController = controller;
+        runtime.clearResponseTimeout = vi.fn();
+        if (provider.id === broken.id) {
+          return createDelayedFailure({
+            delayMs: 10,
+            error: new UpstreamProxyError("provider failed immediately", 502, {
+              body: "provider_failed",
+              providerId: provider.id,
+              providerName: provider.name,
+            }),
+            controller,
+          });
+        }
+        const delayMs = provider.id === refill.id ? 20 : provider.id === third.id ? 70 : 80;
+        return createStreamingResponse({
+          label: provider.name,
+          firstChunkDelayMs: delayMs,
+          controller,
+        });
+      });
+
+      const responsePromise = ProxyForwarder.send(session);
+      await flushHedgeSelection();
+      await waitForCallCount(doForward, 3);
+      await vi.advanceTimersByTimeAsync(15);
+      await flushHedgeSelection();
+      await waitForCallCount(doForward, 4);
+
+      await vi.advanceTimersByTimeAsync(75);
+      const response = await responsePromise;
+      expect(await response.text()).toContain('"provider":"window-refill"');
+      expect(session.provider?.id).toBe(refill.id);
+      expect(mocks.buildPriorityRacePlan).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   test("second sticky timeout cannot win while the Redis hard-exclude decision is pending", async () => {
     vi.useFakeTimers();
 
@@ -1499,9 +1702,7 @@ describe("ProxyForwarder - first-byte hedge scheduling", () => {
       const session = createSession();
       setProviderWithSessionRef(session, provider1);
 
-      mocks.pickRandomProviderWithExclusion
-        .mockResolvedValueOnce(provider2)
-        .mockResolvedValueOnce(provider3);
+      mocks.selectPriorityRaceCandidates.mockResolvedValueOnce([provider2, provider3]);
 
       const doForward = vi.spyOn(
         ProxyForwarder as unknown as {
@@ -1723,7 +1924,8 @@ describe("ProxyForwarder - first-byte hedge scheduling", () => {
       await vi.runAllTimersAsync();
 
       await rejection;
-      expect(controller1.signal.aborted).toBe(true);
+      expect(doForward).not.toHaveBeenCalled();
+      expect(controller1.signal.aborted).toBe(false);
     } finally {
       vi.useRealTimers();
     }
@@ -1897,8 +2099,10 @@ describe("ProxyForwarder - first-byte hedge scheduling", () => {
 
     expect(error).toBe(originalError);
     expect(error.message).toBe("prompt too long");
-    expect(doForward).toHaveBeenCalledTimes(1);
-    expect(mocks.pickRandomProviderWithExclusion).not.toHaveBeenCalled();
+    // Cold-start windows launch their selected peers concurrently, so a client
+    // error discovered by one attempt can only abort peers that are already live.
+    expect(doForward).toHaveBeenCalledTimes(2);
+    expect(mocks.pickRandomProviderWithExclusion).toHaveBeenCalledTimes(1);
     expect(mocks.clearSessionProvider).toHaveBeenCalledWith("sess-hedge");
     expect(session.getProviderChain()).toEqual(
       expect.arrayContaining([
@@ -2009,7 +2213,7 @@ describe("ProxyForwarder - first-byte hedge scheduling", () => {
 
       await vi.advanceTimersByTimeAsync(100);
       await flushHedgeSelection();
-      await waitForCallCount(doForward, 2);
+      expect(doForward.mock.calls.length).toBeGreaterThanOrEqual(2);
 
       await vi.advanceTimersByTimeAsync(55);
       await waitForCallCount(doForward, 3);

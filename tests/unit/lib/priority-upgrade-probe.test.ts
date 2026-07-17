@@ -60,6 +60,7 @@ vi.mock("@/lib/logger", () => ({
 
 import {
   PRIORITY_UPGRADE_PROBE,
+  collectPriorityUpgradeProbeWindow,
   consumePendingPriorityRebind,
   createPriorityUpgradeProbeBatches,
   getPendingPriorityRebind,
@@ -99,6 +100,42 @@ describe("priority-upgrade probe", () => {
     expect(createPriorityUpgradeProbeBatches([p1, p2a, p2b, p2c])).toEqual([[p1, p2a, p2b], [p2c]]);
   });
 
+  it("immediately refills a probe slot after direct failure", async () => {
+    type Outcome = { id: number; state: "ok" | "error" };
+    const launched: number[] = [];
+    const resolvers = new Map<number, (outcome: Outcome) => void>();
+    const onDirectFailure = vi.fn(async () => {});
+
+    const collection = collectPriorityUpgradeProbeWindow({
+      providers: [1, 2, 3, 4],
+      startIndex: 0,
+      execute: (id) => {
+        launched.push(id);
+        return new Promise<Outcome>((resolve) => resolvers.set(id, resolve));
+      },
+      isDirectFailure: (outcome) => outcome.state === "error",
+      onDirectFailure,
+    });
+
+    expect(launched).toEqual([1, 2, 3]);
+    resolvers.get(2)!({ id: 2, state: "error" });
+    await vi.waitFor(() => expect(launched).toEqual([1, 2, 3, 4]));
+    expect(onDirectFailure).toHaveBeenCalledWith({ id: 2, state: "error" });
+
+    resolvers.get(1)!({ id: 1, state: "ok" });
+    resolvers.get(3)!({ id: 3, state: "ok" });
+    resolvers.get(4)!({ id: 4, state: "ok" });
+
+    await expect(collection).resolves.toEqual({
+      outcomes: [
+        { id: 1, state: "ok" },
+        { id: 3, state: "ok" },
+        { id: 4, state: "ok" },
+      ],
+      nextIndex: 4,
+    });
+  });
+
   it("chooses priority before first-byte speed in a mixed batch", () => {
     const p1SlowPass = { provider: { id: 1, priority: 1 }, firstByteMs: 900 };
     const p2FastPass = { provider: { id: 2, priority: 2 }, firstByteMs: 100 };
@@ -110,6 +147,20 @@ describe("priority-upgrade probe", () => {
     expect(selectPriorityUpgradeProbeWinner([p2SlowPass, p2FastPass])?.provider.id).toBe(
       p2FastPass.provider.id
     );
+
+    const rawHighButGroupLow = {
+      provider: { id: 4, priority: 1 },
+      effectivePriority: 3,
+      firstByteMs: 50,
+    };
+    const rawLowButGroupHigh = {
+      provider: { id: 5, priority: 3 },
+      effectivePriority: 1,
+      firstByteMs: 500,
+    };
+    expect(
+      selectPriorityUpgradeProbeWinner([rawHighButGroupLow, rawLowButGroupHigh])?.provider.id
+    ).toBe(rawLowButGroupHigh.provider.id);
   });
 
   it("allows one complete probe round per session interval", async () => {

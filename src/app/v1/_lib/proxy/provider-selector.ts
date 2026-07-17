@@ -34,7 +34,7 @@ import type { ProxySession } from "./session";
  * @param session - 代理会话对象
  * @returns 有效分组字符串，或 null（无认证信息时）
  */
-function getEffectiveProviderGroup(session?: ProxySession): string | null {
+export function getEffectiveProviderGroup(session?: ProxySession): string | null {
   if (!session?.authState) {
     return null;
   }
@@ -774,11 +774,11 @@ export class ProxyProviderResolver {
   }
 
   /**
-   * Build a weighted random order without replacement for one probe priority tier.
-   * Higher-weight providers are more likely to enter the earlier probe batches,
-   * while every provider can still be reached if earlier batches fail.
+   * Build a weighted random order without replacement for one priority tier.
+   * Higher-weight providers are more likely to enter earlier batches, while every
+   * provider remains reachable if earlier candidates fail.
    */
-  private static orderProbeTierByWeight(providers: Provider[]): Provider[] {
+  static orderPriorityTierByWeight(providers: Provider[]): Provider[] {
     const remaining = [...providers];
     const ordered: Provider[] = [];
 
@@ -906,7 +906,7 @@ export class ProxyProviderResolver {
     ].sort((a, b) => a - b);
 
     const candidatesToProbe = priorities.flatMap((priority) =>
-      ProxyProviderResolver.orderProbeTierByWeight(
+      ProxyProviderResolver.orderPriorityTierByWeight(
         higherCandidates.filter(
           (provider) =>
             ProxyProviderResolver.resolveEffectivePriority(provider, effectiveGroup) === priority
@@ -965,14 +965,63 @@ export class ProxyProviderResolver {
       out.push(p);
     }
 
-    // Ensure pickRandomProvider's chosen one is first if present.
-    if (_ignored) {
-      const rest = out.filter((p) => p.id !== _ignored.id);
-      if (out.some((p) => p.id === _ignored.id)) {
-        return [_ignored, ...rest];
-      }
+    // pickRandomProvider already made the first weighted draw. Complete the tier
+    // with weighted random sampling without replacement so every batch slot—not
+    // only the first one—respects provider weights.
+    if (_ignored && out.some((p) => p.id === _ignored.id)) {
+      return [
+        _ignored,
+        ...ProxyProviderResolver.orderPriorityTierByWeight(out.filter((p) => p.id !== _ignored.id)),
+      ];
     }
-    return out;
+    return ProxyProviderResolver.orderPriorityTierByWeight(out);
+  }
+
+  /**
+   * Freeze the complete response-race plan for one request. Each priority tier is
+   * weighted-random without replacement, then tiers are concatenated by effective
+   * priority. Callers consume this array with a single cursor; refills never re-read
+   * provider state or re-randomize the remainder.
+   */
+  static async buildPriorityRacePlan(
+    session: ProxySession,
+    excludeIds: number[] = []
+  ): Promise<Provider[]> {
+    const plan: Provider[] = [];
+    const excluded = new Set(excludeIds);
+
+    while (true) {
+      const tier = await ProxyProviderResolver.selectPriorityTierCandidates(
+        session,
+        Array.from(excluded)
+      );
+      if (tier.length === 0) break;
+
+      let added = 0;
+      for (const provider of tier) {
+        if (excluded.has(provider.id)) continue;
+        plan.push(provider);
+        excluded.add(provider.id);
+        added += 1;
+      }
+      if (added === 0) break;
+    }
+
+    return plan;
+  }
+
+  /**
+   * Compatibility wrapper for callers that only need the first bounded window.
+   * The forwarder freezes and consumes buildPriorityRacePlan() directly.
+   */
+  static async selectPriorityRaceCandidates(
+    session: ProxySession,
+    excludeIds: number[] = [],
+    limit = 3
+  ): Promise<Provider[]> {
+    const size = Math.max(1, Math.floor(limit));
+    const plan = await ProxyProviderResolver.buildPriorityRacePlan(session, excludeIds);
+    return plan.slice(0, size);
   }
 
   private static async pickRandomProvider(
