@@ -22,6 +22,23 @@
     "sessionReuse": "Session reuse → {provider} ✓",
     "originHint": "Session reuse - originally selected via {method}"
   },
+  "priorityUpgrade": {
+    "testTriggered": "This request triggered a priority-upgrade test",
+    "openDetails": "Open priority-upgrade test details",
+    "title": "Priority upgrade test",
+    "subtitle": "Lightweight availability probe for better providers",
+    "candidates": "{count} candidates",
+    "firstByte": "First byte {ms}ms",
+    "testingHint": "Testing is in progress; results update with the log",
+    "finishedHint": "Passed providers will be tried on the next request",
+    "status": {
+      "testing": "Testing",
+      "passed": "Passed · pending upgrade",
+      "passedNotSelected": "Passed · slower in batch",
+      "failed": "Test failed",
+      "discarded": "Route changed · result discarded"
+    }
+  },
   "description": {
     "noDecisionRecord": "No decision record",
     "sessionReuse": "Session Reuse - Provider Selection",

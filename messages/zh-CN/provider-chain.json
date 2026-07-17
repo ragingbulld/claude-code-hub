@@ -22,6 +22,23 @@
     "sessionReuse": "会话复用 → {provider} ✓",
     "originHint": "会话复用 - 最初通过 {method} 选择"
   },
+  "priorityUpgrade": {
+    "testTriggered": "该请求触发了优先级升级测试",
+    "openDetails": "查看优先级升级测试详情",
+    "title": "优先级升级测试",
+    "subtitle": "旁路检测更优供应商的可用性",
+    "candidates": "{count} 个候选",
+    "firstByte": "首字节 {ms}ms",
+    "testingHint": "测试进行中，结果会随日志刷新自动更新",
+    "finishedHint": "通过的供应商将在下一次请求中尝试升级",
+    "status": {
+      "testing": "正在测试",
+      "passed": "测试通过 · 等待升级",
+      "passedNotSelected": "测试通过 · 同批较慢",
+      "failed": "测试未通过",
+      "discarded": "路由已变化 · 结果作废"
+    }
+  },
   "description": {
     "noDecisionRecord": "无决策记录",
     "sessionReuse": "会话复用选择供应商",

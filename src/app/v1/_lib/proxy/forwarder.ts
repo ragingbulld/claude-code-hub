@@ -24,9 +24,23 @@ import { recordEndpointFailure, recordEndpointSuccess } from "@/lib/endpoint-cir
 import { applyGeminiGoogleSearchOverrideWithAudit } from "@/lib/gemini/provider-overrides";
 import { logger } from "@/lib/logger";
 import {
+  isPriorityUpgradeFirstByteSlaMet,
+  PRIORITY_UPGRADE_PROBE,
+  refreshSessionProbeRoundLock,
+  releaseProbeInflightSlot,
+  releaseProviderProbeLock,
+  releaseSessionProbeRoundLock,
+  setPendingPriorityRebindIfEpoch,
+  tryAcquireProbeInflightSlot,
+  tryAcquireProviderProbeLock,
+  tryAcquireSessionProbeGate,
+  tryAcquireSessionProbeRoundLock,
+} from "@/lib/priority-upgrade-probe";
+import {
   getEndpointFilterStats,
   getPreferredProviderEndpoints,
 } from "@/lib/provider-endpoints/endpoint-selector";
+import { executeProviderTest } from "@/lib/provider-testing/test-service";
 import { getGlobalAgentPool, getProxyAgentForProvider } from "@/lib/proxy-agent";
 import { RateLimitService } from "@/lib/rate-limit/service";
 import { SessionManager } from "@/lib/session-manager";
@@ -39,6 +53,7 @@ import {
   recordVendorTypeAllEndpointsTimeout,
 } from "@/lib/vendor-type-circuit-breaker";
 import { updateMessageRequestDetails } from "@/repository/message";
+import { findProviderById } from "@/repository/provider";
 import type { CacheTtlPreference, CacheTtlResolved } from "@/types/cache";
 import type { ProviderChainItem } from "@/types/message";
 import type { Provider } from "@/types/provider";
@@ -211,6 +226,13 @@ type StreamingHedgeAttempt = {
   reactiveRectifierRetryState: ReactiveRectifierRetryState;
   settled: boolean;
   thresholdTriggered: boolean;
+  /**
+   * 硬排除：超时后不可再凭后续首包反超。
+   * sticky 绑定源第一次连续超时为 false（软宽限）；连续第二次或非 sticky 为 true。
+   */
+  hardExcluded: boolean;
+  /** Pending Redis decision that classifies a sticky timeout as soft or hard. */
+  thresholdDecision: Promise<void> | null;
   thresholdTimer: NodeJS.Timeout | null;
   reader: ReadableStreamDefaultReader<Uint8Array> | null;
   response: Response | null;
@@ -3784,6 +3806,7 @@ export class ProxyForwarder {
     const billHedgeLosers = (await getCachedSystemSettings()).billHedgeLosers === true;
     const launchedProviderIds = new Set<number>();
     let launchedProviderCount = 0;
+    let nextAttemptSequence = 1;
     let settled = false;
     let winnerCommitted = false;
     let winnerAttempt: StreamingHedgeAttempt | null = null;
@@ -4011,19 +4034,65 @@ export class ProxyForwarder {
         attempt.thresholdTimer = null;
       }
       attempt.thresholdTriggered = false;
+      attempt.hardExcluded = false;
+      attempt.thresholdDecision = null;
 
       if (attempt.firstByteTimeoutMs <= 0) return;
 
       attempt.thresholdTimer = setTimeout(() => {
-        if (settled || attempt.settled || attempt.thresholdTriggered) return;
+        if (settled || winnerCommitted || attempt.settled || attempt.thresholdTriggered) return;
         attempt.thresholdTriggered = true;
-        session.addProviderToChain(attempt.provider, {
-          ...attempt.endpointAudit,
-          reason: "hedge_triggered",
-          attemptNumber: attempt.sequence,
-          circuitState: getCircuitState(attempt.provider.id),
+
+        const decision = (async () => {
+          // sticky 绑定源：连续第一次超时软宽限（可补枪、仍可反超）；
+          // 连续第二次超时硬杀。中间成功会重置 streak。
+          // 非 sticky / 补枪 attempt：一律硬杀。
+          const isStickyBoundAttempt = session
+            .getProviderChain()
+            .some((item) => item.reason === "session_reuse" && item.id === attempt.provider.id);
+
+          let hardExclude = true;
+          let streak = 0;
+          if (isStickyBoundAttempt && session.sessionId) {
+            const result = await SessionManager.recordStickyFirstByteTimeout(session.sessionId);
+            hardExclude = result.hardExclude;
+            streak = result.streak;
+          }
+
+          if (hardExclude) {
+            attempt.hardExcluded = true;
+            session.addProviderToChain(attempt.provider, {
+              ...attempt.endpointAudit,
+              reason: "hedge_timeout_excluded",
+              attemptNumber: attempt.sequence,
+              circuitState: getCircuitState(attempt.provider.id),
+              errorMessage:
+                isStickyBoundAttempt && streak > 0
+                  ? `first_byte_timeout_consecutive_${streak}`
+                  : "first_byte_timeout",
+            });
+            // Priority-upgrade recovery uses only the per-session round interval.
+            // A failed/timed-out provider is retried in the next complete round.
+            // 硬杀输家。bill_hedge_losers 开启时由 abortAttempt 走后台 drain 计费。
+            abortAttempt(attempt, "hedge_loser");
+          } else {
+            // 软宽限：不 abort，保留时间优势，仍可成为赢家。
+            session.addProviderToChain(attempt.provider, {
+              ...attempt.endpointAudit,
+              reason: "hedge_timeout_grace",
+              attemptNumber: attempt.sequence,
+              circuitState: getCircuitState(attempt.provider.id),
+              errorMessage: `first_byte_timeout_soft_grace_streak_${streak || 1}`,
+            });
+          }
+
+          void launchAlternative();
+          void finishIfExhausted();
+        })();
+        attempt.thresholdDecision = decision;
+        void decision.finally(() => {
+          if (attempt.thresholdDecision === decision) attempt.thresholdDecision = null;
         });
-        void launchAlternative();
       }, attempt.firstByteTimeoutMs);
     };
 
@@ -4040,6 +4109,18 @@ export class ProxyForwarder {
       }
     };
 
+    // Cancel any in-flight priority-upgrade cheap test for this session: a real
+    // hedge race is already changing providers, so the side-path probe is obsolete.
+    const cancelPriorityUpgradeProbe = async (): Promise<void> => {
+      if (!session.sessionId) return;
+      await SessionManager.markPriorityUpgradeProbeCancelled(session.sessionId);
+    };
+
+    /**
+     * Launch the next hedge batch: all remaining candidates at the best (lowest)
+     * remaining priority tier, highest-priority first. Same rule for cold-start
+     * cascade and sticky/timeout-triggered cascade.
+     */
     const launchAlternative = async () => {
       if (settled || winnerCommitted || noMoreProviders) return;
       if (launchingAlternative) {
@@ -4048,23 +4129,56 @@ export class ProxyForwarder {
       }
 
       launchingAlternative = (async () => {
+        await cancelPriorityUpgradeProbe();
+
         while (!settled && !winnerCommitted && !noMoreProviders) {
-          const alternativeProvider = await ProxyForwarder.selectAlternative(
+          // Batch-by-batch: do not descend to a lower priority while any peer in the
+          // current race is still inside its first-byte window.
+          const stillRacingWithinSla = Array.from(attempts).some(
+            (a) => !a.settled && !a.hardExcluded && !a.thresholdTriggered
+          );
+          if (stillRacingWithinSla) {
+            return;
+          }
+
+          const batch = await ProxyProviderResolver.selectPriorityTierCandidates(
             session,
             Array.from(launchedProviderIds)
           );
-          if (!alternativeProvider) {
+
+          if (!batch || batch.length === 0) {
             noMoreProviders = true;
-            // No alternative providers available — let in-flight attempt(s) continue.
-            // If all attempts already completed, settle with last error.
             if (attempts.size === 0) {
               await finishIfExhausted();
             }
             return;
           }
 
-          const launched = await startAttempt(alternativeProvider, false);
-          if (launched) return;
+          // Cap per-tier fan-out so one huge tier cannot stampede upstream.
+          const MAX_TIER_BATCH = 5;
+          const tierBatch = batch.slice(0, MAX_TIER_BATCH);
+          const tierPriority =
+            ProxyProviderResolver.resolveEffectivePriority(tierBatch[0], null) ??
+            tierBatch[0]?.priority ??
+            0;
+
+          session.addProviderToChain(tierBatch[0], {
+            reason: "hedge_batch_launched",
+            attemptNumber: launchedProviderCount + 1,
+            circuitState: getCircuitState(tierBatch[0].id),
+            errorMessage: `priority=${tierPriority};batch_size=${tierBatch.length}`,
+          });
+
+          const launchResults = await Promise.all(
+            tierBatch.map((provider) => startAttempt(provider, false))
+          );
+          const launchedAny = launchResults.some(Boolean);
+
+          // One tier per launchAlternative call. Further tiers wait for the next
+          // first-byte timeout of this batch (or hard failure).
+          if (launchedAny) return;
+
+          // Entire tier failed to start — drop to next tier immediately.
         }
       })()
         .catch(async (error) => {
@@ -4399,7 +4513,20 @@ export class ProxyForwarder {
     };
 
     const commitWinner = async (attempt: StreamingHedgeAttempt, firstChunk: Uint8Array) => {
-      if (settled || winnerCommitted || attempt.settled || !attempt.response || !attempt.reader)
+      // The SLA timer may be awaiting Redis to decide first-soft vs second-hard.
+      // Do not let a first chunk commit through that decision window.
+      if (attempt.thresholdDecision) {
+        await attempt.thresholdDecision;
+      }
+      // 硬排除后不可再凭后续首包反超；软宽限（thresholdTriggered 但未 hardExcluded）仍可赢。
+      if (
+        settled ||
+        winnerCommitted ||
+        attempt.settled ||
+        attempt.hardExcluded ||
+        !attempt.response ||
+        !attempt.reader
+      )
         return;
 
       winnerCommitted = true;
@@ -4449,6 +4576,28 @@ export class ProxyForwarder {
       // Note: launchedProviderCount is the most reliable indicator - if > 1, multiple providers were launched
       const isActualHedgeWin = launchedProviderCount > 1;
 
+      // A priority-upgrade cheap test is useful only when the sticky request is healthy.
+      // Start it after the sticky provider returns its first byte within SLA. If the
+      // first-byte threshold already fired (including sticky soft grace), or another
+      // provider was launched for a hedge/failover, skip the test for this request.
+      const upgradePlan = session.getPriorityUpgradePlan();
+      const isHealthyStickyWinner = session
+        .getProviderChain()
+        .some((item) => item.reason === "session_reuse" && item.id === attempt.provider.id);
+      if (
+        upgradePlan?.mode === "cheap_test_only" &&
+        isHealthyStickyWinner &&
+        attempt.provider.id === initialProvider.id &&
+        !attempt.thresholdTriggered &&
+        !isActualHedgeWin
+      ) {
+        void ProxyForwarder.runPriorityUpgradeCheapTest(
+          session,
+          upgradePlan.higherPriorityProviderIds,
+          upgradePlan.probeEpoch
+        );
+      }
+
       session.addProviderToChain(attempt.provider, {
         ...attempt.endpointAudit,
         reason: isActualHedgeWin ? "hedge_winner" : "request_success",
@@ -4457,10 +4606,30 @@ export class ProxyForwarder {
         modelRedirect: getAttemptModelRedirect(attempt),
       });
 
+      // 只有在首字 SLA 内成功，才清零 sticky 连续超时 streak。
+      // 软宽限后晚到并获胜仍然算一次超时，下一次再超时必须硬淘汰。
+      if (session.sessionId) {
+        const stickyBoundId = session
+          .getProviderChain()
+          .find((item) => item.reason === "session_reuse")?.id;
+        if (
+          stickyBoundId != null &&
+          attempt.provider.id === stickyBoundId &&
+          !attempt.thresholdTriggered
+        ) {
+          await SessionManager.resetStickyFirstByteTimeoutStreak(session.sessionId);
+        }
+      }
+
       abortAllAttempts(attempt, "hedge_loser");
 
       if (session.sessionId) {
         void (async () => {
+          const plan = session.getPriorityUpgradePlan();
+          // Cheap-test-pass rebind: force sticky onto the higher-priority provider.
+          // Otherwise keep existing hedge forceUpdate semantics for real races.
+          const forceUpdate = plan?.mode === "apply_pending_rebind" || isActualHedgeWin;
+
           const bindingResult = await SessionManager.updateSessionBindingSmart(
             session.sessionId!,
             attempt.provider.id,
@@ -4468,8 +4637,7 @@ export class ProxyForwarder {
             launchedProviderCount === 1 && attempt.provider.id === initialProvider.id,
             attempt.provider.id !== initialProvider.id,
             session.authState?.key?.id ?? null,
-            // 产生了真实竞速赢家时，无条件把 Session 复用绑定改绑到赢家。
-            isActualHedgeWin
+            forceUpdate
           );
 
           if (bindingResult.updated) {
@@ -4531,6 +4699,7 @@ export class ProxyForwarder {
       }
 
       launchedProviderIds.add(provider.id);
+      const reservedSequence = nextAttemptSequence++;
 
       if (!useOriginalSession && session.sessionId) {
         const limit = provider.limitConcurrentSessions || 0;
@@ -4545,7 +4714,7 @@ export class ProxyForwarder {
           session.addProviderToChain(provider, {
             reason: "concurrent_limit_failed",
             circuitState: getCircuitState(provider.id),
-            attemptNumber: launchedProviderCount + 1,
+            attemptNumber: reservedSequence,
             errorMessage: checkResult.reason || "并发限制已达到",
           });
           return false;
@@ -4590,7 +4759,7 @@ export class ProxyForwarder {
         clearResponseTimeout: null,
         firstByteTimeoutMs:
           provider.firstByteTimeoutStreamingMs > 0 ? provider.firstByteTimeoutStreamingMs : 0,
-        sequence: launchedProviderCount,
+        sequence: reservedSequence,
         requestAttemptCount: 1,
         reactiveRectifierRetryState: {
           thinkingSignatureRetried: false,
@@ -4600,6 +4769,8 @@ export class ProxyForwarder {
         },
         settled: false,
         thresholdTriggered: false,
+        hardExcluded: false,
+        thresholdDecision: null,
         thresholdTimer: null,
         reader: null,
         response: null,
@@ -4617,7 +4788,7 @@ export class ProxyForwarder {
 
       // Record hedge participant launch in decision chain
       // (first provider is already recorded via initial_selection or session_reuse)
-      if (launchedProviderCount > 1) {
+      if (reservedSequence > 1) {
         session.addProviderToChain(provider, {
           ...attempt.endpointAudit,
           reason: "hedge_launched",
@@ -4652,11 +4823,72 @@ export class ProxyForwarder {
       void finishIfExhausted();
     });
 
-    try {
-      const initialLaunched = await startAttempt(initialProvider, true);
-      if (!initialLaunched) {
+    // 冷启动/无粘性：从最高优先级整批竞速，超时后再下一批更低优先级。
+    // sticky / pending rebind 仍单发；priority-upgrade 只做旁路 cheap test，过关后下次直接改绑。
+    const launchInitialBatch = async () => {
+      const isSessionReuse = session
+        .getProviderChain()
+        .some((item) => item.reason === "session_reuse" && item.id === initialProvider.id);
+      const upgradePlan = session.getPriorityUpgradePlan();
+
+      // Sticky reuse or pending rebind: single-send primary.
+      // Cheap tests are deferred until commitWinner proves that the sticky source
+      // returned its first byte within SLA and no hedge/failover was launched.
+      if (isSessionReuse || upgradePlan?.mode === "apply_pending_rebind") {
+        const initialLaunched = await startAttempt(initialProvider, true);
+        if (!initialLaunched) {
+          await launchAlternative();
+        }
+        return;
+      }
+
+      if ((initialProvider.firstByteTimeoutStreamingMs ?? 0) <= 0) {
+        const initialLaunched = await startAttempt(initialProvider, true);
+        if (!initialLaunched) {
+          await launchAlternative();
+        }
+        return;
+      }
+
+      // Cold start: race the entire top priority tier (same rule as timeout cascade).
+      const topTier = (await ProxyProviderResolver.selectPriorityTierCandidates(session, [])) ?? [];
+      const MAX_INITIAL_BATCH = 5;
+      const ordered = topTier.filter((p) => p.id !== initialProvider.id);
+      const batchProviders: Provider[] = [initialProvider, ...ordered].slice(0, MAX_INITIAL_BATCH);
+
+      if (batchProviders.length <= 1) {
+        const initialLaunched = await startAttempt(initialProvider, true);
+        if (!initialLaunched) {
+          await launchAlternative();
+        }
+        return;
+      }
+
+      const tierPriority = initialProvider.priority || 0;
+      session.addProviderToChain(initialProvider, {
+        reason: "hedge_batch_launched",
+        attemptNumber: 0,
+        circuitState: getCircuitState(initialProvider.id),
+        errorMessage: `priority=${tierPriority};batch_size=${batchProviders.length}`,
+      });
+
+      // 初始供应商必须用原 session；其余用 shadow session。所有同档成员
+      // 同时进入异步 preflight，避免 endpoint/concurrency 解析造成先后手。
+      const launchResults = await Promise.all(
+        batchProviders.map((provider, index) => {
+          if (index > 0 && (provider.firstByteTimeoutStreamingMs ?? 0) <= 0) {
+            return Promise.resolve(false);
+          }
+          return startAttempt(provider, index === 0);
+        })
+      );
+      if (!launchResults.some(Boolean)) {
         await launchAlternative();
       }
+    };
+
+    try {
+      await launchInitialBatch();
       await finishIfExhausted();
       const result = await resultPromise;
       if (result.error) {
@@ -4665,6 +4897,279 @@ export class ProxyForwarder {
       return result.response as Response;
     } finally {
       cleanupClientAbortListener();
+    }
+  }
+
+  private static async runPriorityUpgradeCheapTest(
+    session: ProxySession,
+    providerIds: number[],
+    probeEpoch: number
+  ): Promise<void> {
+    const uniqueIds = [...new Set(providerIds)].filter((id) => Number.isFinite(id) && id > 0);
+    if (uniqueIds.length === 0) return;
+
+    const providers = (await Promise.all(uniqueIds.map((id) => findProviderById(id))))
+      .filter((provider): provider is Provider => Boolean(provider?.isEnabled))
+      .sort((a, b) => {
+        const priorityDiff = (a.priority || 0) - (b.priority || 0);
+        if (priorityDiff !== 0) return priorityDiff;
+        return uniqueIds.indexOf(a.id) - uniqueIds.indexOf(b.id);
+      });
+    if (providers.length === 0) return;
+    if (!session.sessionId) return;
+    const sessionId = session.sessionId;
+    const roundLockToken = await tryAcquireSessionProbeRoundLock(sessionId);
+    if (!roundLockToken) return;
+
+    const roundLockRefreshTimer = setInterval(() => {
+      void refreshSessionProbeRoundLock(sessionId, roundLockToken);
+    }, PRIORITY_UPGRADE_PROBE.SESSION_ROUND_LOCK_REFRESH_MS);
+    roundLockRefreshTimer.unref();
+
+    try {
+      if (!(await tryAcquireSessionProbeGate(sessionId))) return;
+      await ProxyForwarder.executePriorityUpgradeCheapTestRound(session, providers, probeEpoch);
+    } finally {
+      clearInterval(roundLockRefreshTimer);
+      await releaseSessionProbeRoundLock(sessionId, roundLockToken);
+    }
+  }
+
+  private static async executePriorityUpgradeCheapTestRound(
+    session: ProxySession,
+    providers: Provider[],
+    probeEpoch: number
+  ): Promise<void> {
+    let probeChainPersistQueue = Promise.resolve();
+    const persistProbeChain = (): Promise<void> => {
+      const messageRequestId = session.messageContext?.id;
+      if (messageRequestId == null) return Promise.resolve();
+      const providerChain = [...session.getProviderChain()];
+      probeChainPersistQueue = probeChainPersistQueue
+        .then(() => updateMessageRequestDetails(messageRequestId, { providerChain }))
+        .catch((error) => {
+          logger.warn("ProxyForwarder: failed to persist priority-upgrade probe chain", {
+            messageRequestId,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        });
+      return probeChainPersistQueue;
+    };
+
+    const isProbeCurrent = async (): Promise<boolean> => {
+      if (!session.sessionId) return true;
+      const [cancelled, currentEpoch] = await Promise.all([
+        SessionManager.isPriorityUpgradeProbeCancelled(session.sessionId),
+        SessionManager.getPriorityUpgradeProbeEpoch(session.sessionId),
+      ]);
+      return !cancelled && currentEpoch === probeEpoch;
+    };
+
+    const model = session.getCurrentModel() || session.getOriginalModel() || undefined;
+    const priorities = [...new Set(providers.map((provider) => provider.priority || 0))].sort(
+      (a, b) => a - b
+    );
+
+    for (const priority of priorities) {
+      const tier = providers.filter((provider) => (provider.priority || 0) === priority);
+
+      // Test one bounded batch at a time. A whole priority tier must fail before
+      // moving toward the current (more expensive) sticky provider.
+      for (
+        let offset = 0;
+        offset < tier.length;
+        offset += PRIORITY_UPGRADE_PROBE.GLOBAL_INFLIGHT_LIMIT
+      ) {
+        if (!(await isProbeCurrent())) return;
+
+        const batch = tier.slice(offset, offset + PRIORITY_UPGRADE_PROBE.GLOBAL_INFLIGHT_LIMIT);
+        const outcomes = await Promise.all(
+          batch.map(async (provider) => {
+            const providerLockToken = await tryAcquireProviderProbeLock(provider.id);
+            if (!providerLockToken) return { provider, state: "deferred" as const };
+
+            const inflightToken = await tryAcquireProbeInflightSlot();
+            if (!inflightToken) {
+              await releaseProviderProbeLock(provider.id, providerLockToken);
+              return { provider, state: "deferred" as const };
+            }
+
+            session.addProviderToChain(provider, {
+              reason: "priority_upgrade_probe",
+              selectionMethod: "priority_upgrade",
+              circuitState: getCircuitState(provider.id),
+              errorMessage: "cheap_test_start",
+            });
+            await persistProbeChain();
+
+            const timeoutMs =
+              provider.firstByteTimeoutStreamingMs > 0
+                ? provider.firstByteTimeoutStreamingMs
+                : PRIORITY_UPGRADE_PROBE.DEFAULT_TIMEOUT_MS;
+            const totalTimeoutMs = Math.min(
+              PRIORITY_UPGRADE_PROBE.PROVIDER_LOCK_MS - 5_000,
+              timeoutMs + 30_000
+            );
+
+            try {
+              const result = await executeProviderTest({
+                providerId: String(provider.id),
+                providerUrl: provider.url,
+                apiKey: provider.key,
+                providerType: provider.providerType,
+                model: model || undefined,
+                proxyUrl: provider.proxyUrl ?? undefined,
+                proxyFallbackToDirect: provider.proxyFallbackToDirect,
+                customHeaders: provider.customHeaders ?? undefined,
+                timeoutMs: totalTimeoutMs,
+                firstByteTimeoutMs: timeoutMs,
+                latencyThresholdMs: timeoutMs,
+              });
+              return {
+                provider,
+                providerLockToken,
+                state: "completed" as const,
+                result,
+                timeoutMs,
+              };
+            } catch (error) {
+              return {
+                provider,
+                providerLockToken,
+                state: "errored" as const,
+                error,
+                timeoutMs,
+              };
+            } finally {
+              await releaseProbeInflightSlot(inflightToken);
+            }
+          })
+        );
+
+        if (!(await isProbeCurrent())) {
+          for (const outcome of outcomes) {
+            if (outcome.state === "completed" || outcome.state === "errored") {
+              await releaseProviderProbeLock(outcome.provider.id, outcome.providerLockToken);
+            }
+          }
+          for (const outcome of outcomes) {
+            if (outcome.state !== "completed" && outcome.state !== "errored") continue;
+            session.addProviderToChain(outcome.provider, {
+              reason: "priority_upgrade_probe",
+              selectionMethod: "priority_upgrade",
+              circuitState: getCircuitState(outcome.provider.id),
+              errorMessage: "cheap_test_discarded_hedge_race",
+            });
+          }
+          await persistProbeChain();
+          return;
+        }
+
+        const passed: Array<{
+          provider: Provider;
+          providerLockToken: string;
+          firstByteMs: number;
+        }> = [];
+        let deferred = false;
+
+        for (const outcome of outcomes) {
+          if (outcome.state === "deferred") {
+            deferred = true;
+            continue;
+          }
+
+          if (outcome.state === "errored") {
+            await releaseProviderProbeLock(outcome.provider.id, outcome.providerLockToken);
+            session.addProviderToChain(outcome.provider, {
+              reason: "priority_upgrade_probe",
+              selectionMethod: "priority_upgrade",
+              circuitState: getCircuitState(outcome.provider.id),
+              errorMessage: "cheap_test_error",
+            });
+            await persistProbeChain();
+            logger.debug("ProxyForwarder: priority-upgrade cheap test failed", {
+              providerId: outcome.provider.id,
+              error: outcome.error instanceof Error ? outcome.error.message : String(outcome.error),
+              sessionId: session.sessionId ?? null,
+            });
+            continue;
+          }
+
+          const result = outcome.result;
+          const withinSla = isPriorityUpgradeFirstByteSlaMet(result, outcome.timeoutMs);
+          const firstByteMs = result.firstByteMs;
+
+          if (withinSla && firstByteMs !== undefined) {
+            passed.push({
+              provider: outcome.provider,
+              providerLockToken: outcome.providerLockToken,
+              firstByteMs,
+            });
+          } else {
+            await releaseProviderProbeLock(outcome.provider.id, outcome.providerLockToken);
+            session.addProviderToChain(outcome.provider, {
+              reason: "priority_upgrade_probe",
+              selectionMethod: "priority_upgrade",
+              circuitState: getCircuitState(outcome.provider.id),
+              errorMessage: `cheap_test_fail_status=${result.status}_first_byte_ms=${firstByteMs ?? -1}`,
+            });
+            await persistProbeChain();
+          }
+        }
+
+        if (passed.length > 0) {
+          passed.sort((a, b) => a.firstByteMs - b.firstByteMs);
+          const winner = passed[0];
+          const published = session.sessionId
+            ? await setPendingPriorityRebindIfEpoch(
+                session.sessionId,
+                winner.provider.id,
+                probeEpoch
+              )
+            : false;
+
+          for (const candidate of passed) {
+            await releaseProviderProbeLock(candidate.provider.id, candidate.providerLockToken);
+          }
+
+          if (!published) {
+            for (const candidate of passed) {
+              session.addProviderToChain(candidate.provider, {
+                reason: "priority_upgrade_probe",
+                selectionMethod: "priority_upgrade",
+                circuitState: getCircuitState(candidate.provider.id),
+                errorMessage: "cheap_test_discarded_hedge_race",
+              });
+            }
+            await persistProbeChain();
+            return;
+          }
+
+          for (const candidate of passed) {
+            if (candidate.provider.id === winner.provider.id) continue;
+            session.addProviderToChain(candidate.provider, {
+              reason: "priority_upgrade_probe",
+              selectionMethod: "priority_upgrade",
+              circuitState: getCircuitState(candidate.provider.id),
+              errorMessage: `cheap_test_ok_not_selected_first_byte_ms=${candidate.firstByteMs}`,
+            });
+          }
+
+          session.addProviderToChain(winner.provider, {
+            reason: "priority_upgrade_probe",
+            selectionMethod: "priority_upgrade",
+            circuitState: getCircuitState(winner.provider.id),
+            errorMessage: `cheap_test_ok_pending_rebind_first_byte_ms=${winner.firstByteMs}`,
+          });
+          await persistProbeChain();
+          return;
+        }
+
+        // A busy global/provider lock means part of this priority tier was not
+        // actually tested. Wait for a later healthy request instead of skipping
+        // to a lower-priority (more expensive) tier.
+        if (deferred) return;
+      }
     }
   }
 

@@ -22,6 +22,23 @@
     "sessionReuse": "セッション再利用 → {provider} ✓",
     "originHint": "セッション再利用 - 元は {method} で選択"
   },
+  "priorityUpgrade": {
+    "testTriggered": "このリクエストで優先度アップグレードテストが実行されました",
+    "openDetails": "優先度アップグレードテストの詳細を開く",
+    "title": "優先度アップグレードテスト",
+    "subtitle": "より優先度の高いプロバイダーの軽量可用性テスト",
+    "candidates": "候補 {count} 件",
+    "firstByte": "初回応答 {ms}ms",
+    "testingHint": "テスト中です。結果はログ更新時に反映されます",
+    "finishedHint": "合格したプロバイダーは次のリクエストで試されます",
+    "status": {
+      "testing": "テスト中",
+      "passed": "合格 · アップグレード待ち",
+      "passedNotSelected": "合格 · 同一バッチ内で低速",
+      "failed": "テスト失敗",
+      "discarded": "ルート変更 · 結果破棄"
+    }
+  },
   "description": {
     "noDecisionRecord": "決定記録なし",
     "sessionReuse": "セッション再利用 - プロバイダー選択",

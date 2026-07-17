@@ -126,7 +126,15 @@ function getProviderStatus(item: ProviderChainItem): "✓" | "✗" | "⚡" | "�
     return "↓";
   }
   // Hedge 触发和启动（信息性事件，不是请求结果）
-  if (item.reason === "hedge_triggered" || item.reason === "hedge_launched") {
+  if (
+    item.reason === "hedge_triggered" ||
+    item.reason === "hedge_launched" ||
+    item.reason === "hedge_batch_launched" ||
+    item.reason === "hedge_timeout_excluded" ||
+    item.reason === "hedge_timeout_grace" ||
+    item.reason === "priority_upgrade_probe" ||
+    item.reason === "priority_upgrade_rebind"
+  ) {
     return null;
   }
   // 中间状态（选择成功但还没有请求结果）
@@ -165,7 +173,16 @@ export function isActualRequest(item: ProviderChainItem): boolean {
     return true;
 
   // Hedge 触发和启动：信息性事件，不算实际请求
-  if (item.reason === "hedge_triggered" || item.reason === "hedge_launched") return false;
+  if (
+    item.reason === "hedge_triggered" ||
+    item.reason === "hedge_launched" ||
+    item.reason === "hedge_batch_launched" ||
+    item.reason === "hedge_timeout_excluded" ||
+    item.reason === "hedge_timeout_grace" ||
+    item.reason === "priority_upgrade_probe" ||
+    item.reason === "priority_upgrade_rebind"
+  )
+    return false;
 
   // HTTP/2 回退：算作一次中间事件（显示但不计入失败）
   if (item.reason === "http2_fallback") return true;
@@ -188,10 +205,31 @@ export function isHedgeRace(chain: ProviderChainItem[]): boolean {
     (item) =>
       item.reason === "hedge_triggered" ||
       item.reason === "hedge_launched" ||
+      item.reason === "hedge_batch_launched" ||
+      item.reason === "hedge_timeout_excluded" ||
+      item.reason === "hedge_timeout_grace" ||
       item.reason === "hedge_winner" ||
       item.reason === "hedge_loser_cancelled" ||
       item.reason === "hedge_loser_billed"
   );
+}
+
+/** Side-path cheap probe for priority upgrade (not a billed user request). */
+export function hasPriorityUpgradeProbe(chain: ProviderChainItem[]): boolean {
+  return chain.some((item) => item.reason === "priority_upgrade_probe");
+}
+
+/** Next-request rebind after a successful cheap probe. */
+export function hasPriorityUpgradeRebind(chain: ProviderChainItem[]): boolean {
+  return chain.some((item) => item.reason === "priority_upgrade_rebind");
+}
+
+export function isPriorityUpgradeProbeItem(item: ProviderChainItem): boolean {
+  return item.reason === "priority_upgrade_probe";
+}
+
+export function isPriorityUpgradeRebindItem(item: ProviderChainItem): boolean {
+  return item.reason === "priority_upgrade_rebind";
 }
 
 /**

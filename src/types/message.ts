@@ -44,6 +44,11 @@ export interface ProviderChainItem {
     | "client_restriction_filtered" // Provider skipped due to client restriction (neutral, no circuit breaker)
     | "hedge_triggered" // Hedge 计时器触发，启动备选供应商
     | "hedge_launched" // Hedge 备选供应商已启动（信息性记录，不算实际请求）
+    | "hedge_batch_launched" // 冷启动/无粘性时同档批量竞速启动
+    | "hedge_timeout_excluded" // 首字超时直接排除（按输家处理）
+    | "hedge_timeout_grace" // sticky 绑定源第一次连续首字超时：软宽限，可反超
+    | "priority_upgrade_probe" // 旁路 cheap 测试更高优先级供应商
+    | "priority_upgrade_rebind" // 改绑到更高优先级
     | "hedge_winner" // 该供应商赢得 Hedge 竞速（最先收到首字节）
     | "hedge_loser_cancelled" // 该供应商输掉 Hedge 竞速，请求被取消（未对输家计费）
     | "hedge_loser_billed" // 该供应商输掉 Hedge 竞速，但其上游响应被后台拿回并计费
@@ -54,6 +59,7 @@ export interface ProviderChainItem {
     | "session_reuse" // 会话复用
     | "weighted_random" // 加权随机
     | "group_filtered" // 分组筛选后随机
+    | "priority_upgrade" // 优先级升级探测/改绑
     | "fail_open_fallback"; // Fail Open 降级
 
   // 供应商配置（决策依据）

@@ -117,19 +117,19 @@ function createSession({
 }
 
 describe("ProxySession endpoint policy", () => {
-  it.each([
-    V1_ENDPOINT_PATHS.MESSAGES_COUNT_TOKENS,
-    "/V1/RESPONSES/COMPACT/",
-  ])("应在创建时解析 raw passthrough policy: %s", (pathname) => {
-    const session = createSession({
-      redirectedModel: null,
-      requestUrl: new URL(`http://localhost${pathname}`),
-    });
+  it.each([V1_ENDPOINT_PATHS.MESSAGES_COUNT_TOKENS, "/V1/RESPONSES/COMPACT/"])(
+    "应在创建时解析 raw passthrough policy: %s",
+    (pathname) => {
+      const session = createSession({
+        redirectedModel: null,
+        requestUrl: new URL(`http://localhost${pathname}`),
+      });
 
-    const policy = session.getEndpointPolicy();
-    expect(isRawPassthroughEndpointPolicy(policy)).toBe(true);
-    expect(policy.trackConcurrentRequests).toBe(false);
-  });
+      const policy = session.getEndpointPolicy();
+      expect(isRawPassthroughEndpointPolicy(policy)).toBe(true);
+      expect(policy.trackConcurrentRequests).toBe(false);
+    }
+  );
 
   it("应在请求路径后续变更后保持创建时 policy 不变", () => {
     const session = createSession({
@@ -870,5 +870,39 @@ describe("ProxySession.addProviderToChain - endpoint audit", () => {
         endpointUrl: "https://b.example.com",
       })
     );
+  });
+
+  it("优先级探测同一 provider 的开始与终态相邻时应同时保留", () => {
+    const session = createSession({ redirectedModel: null });
+    const provider = {
+      id: 1,
+      name: "single-candidate",
+      providerVendorId: 123,
+      providerType: "openai",
+      priority: 3,
+      weight: 1,
+      costMultiplier: 0.02,
+      groupTag: null,
+    } as unknown as Provider;
+
+    session.addProviderToChain(provider, {
+      reason: "priority_upgrade_probe",
+      errorMessage: "cheap_test_start",
+    });
+    session.addProviderToChain(provider, {
+      reason: "priority_upgrade_probe",
+      errorMessage: "cheap_test_ok_pending_rebind_first_byte_ms=456",
+    });
+    session.addProviderToChain(provider, {
+      reason: "priority_upgrade_probe",
+      errorMessage: "cheap_test_ok_pending_rebind_first_byte_ms=456",
+    });
+
+    const chain = session.getProviderChain();
+    expect(chain).toHaveLength(2);
+    expect(chain.map((item) => item.errorMessage)).toEqual([
+      "cheap_test_start",
+      "cheap_test_ok_pending_rebind_first_byte_ms=456",
+    ]);
   });
 });

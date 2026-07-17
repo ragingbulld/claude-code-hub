@@ -690,10 +690,151 @@ export class SessionManager {
     if (!redis || redis.status !== "ready") return;
 
     try {
-      await redis.del(`session:${sessionId}:provider`);
+      // 一并清掉连续首字超时计数，避免旧绑定污染新绑定。
+      await redis.del(
+        `session:${sessionId}:provider`,
+        SessionManager.stickyFirstByteTimeoutStreakKey(sessionId)
+      );
       logger.trace("SessionManager: Cleared session provider binding", { sessionId });
     } catch (error) {
       logger.error("SessionManager: Failed to clear session provider", { error, sessionId });
+    }
+  }
+
+  /**
+   * sticky 绑定源的连续首字超时次数：
+   * - 0: 下一次超时给软宽限（可补枪、仍可反超）
+   * - 1: 已软宽限过一次；若紧接着再超时则硬杀
+   * 中间只要该绑定源成功出首包/正常赢，就重置为 0。
+   */
+  private static stickyFirstByteTimeoutStreakKey(sessionId: string): string {
+    return `session:${sessionId}:sticky_fb_timeout_streak`;
+  }
+
+  static async getStickyFirstByteTimeoutStreak(sessionId: string): Promise<number> {
+    const redis = getRedisClient();
+    if (!redis || redis.status !== "ready") return 0;
+    try {
+      const value = await redis.get(SessionManager.stickyFirstByteTimeoutStreakKey(sessionId));
+      const n = value == null ? 0 : Number.parseInt(value, 10);
+      return Number.isFinite(n) && n > 0 ? n : 0;
+    } catch (error) {
+      logger.error("SessionManager: Failed to read sticky first-byte timeout streak", {
+        error,
+        sessionId,
+      });
+      return 0;
+    }
+  }
+
+  /**
+   * 记录一次 sticky 绑定源首字超时，返回“本次是否应硬杀”。
+   * false = 第一次连续超时：软宽限；true = 连续第二次：硬杀。
+   */
+  static async recordStickyFirstByteTimeout(sessionId: string): Promise<{
+    hardExclude: boolean;
+    streak: number;
+  }> {
+    const redis = getRedisClient();
+    if (!redis || redis.status !== "ready") {
+      // Redis 不可用时保守：不硬杀，避免误杀绑定源。
+      return { hardExclude: false, streak: 1 };
+    }
+    try {
+      const key = SessionManager.stickyFirstByteTimeoutStreakKey(sessionId);
+      const next = await redis.incr(key);
+      await redis.expire(key, SessionManager.SESSION_TTL);
+      // streak=1: 第一次连续超时 → 软宽限；streak>=2: 连续第二次起 → 硬杀
+      return { hardExclude: next >= 2, streak: next };
+    } catch (error) {
+      logger.error("SessionManager: Failed to record sticky first-byte timeout streak", {
+        error,
+        sessionId,
+      });
+      return { hardExclude: false, streak: 1 };
+    }
+  }
+
+  static async resetStickyFirstByteTimeoutStreak(sessionId: string): Promise<void> {
+    const redis = getRedisClient();
+    if (!redis || redis.status !== "ready") return;
+    try {
+      await redis.del(SessionManager.stickyFirstByteTimeoutStreakKey(sessionId));
+    } catch (error) {
+      logger.error("SessionManager: Failed to reset sticky first-byte timeout streak", {
+        error,
+        sessionId,
+      });
+    }
+  }
+
+  private static priorityUpgradeProbeCancelledKey(sessionId: string): string {
+    return `session:${sessionId}:priority_upgrade_probe_cancelled`;
+  }
+
+  private static priorityUpgradeProbeEpochKey(sessionId: string): string {
+    return `session:${sessionId}:priority_upgrade_probe_epoch`;
+  }
+
+  /** Mark in-flight priority-upgrade cheap test as discarded because a hedge race started. */
+  static async markPriorityUpgradeProbeCancelled(sessionId: string): Promise<void> {
+    const redis = getRedisClient();
+    if (!redis || redis.status !== "ready") return;
+    try {
+      // The epoch is the authority: every real hedge race invalidates every older
+      // background probe, even if a later request clears the short-lived flag.
+      await redis.eval(
+        `
+          local epoch = redis.call('INCR', KEYS[1])
+          redis.call('EXPIRE', KEYS[1], 3600)
+          redis.call('SET', KEYS[2], '1', 'EX', 60)
+          redis.call('DEL', KEYS[3])
+          return epoch
+        `,
+        3,
+        SessionManager.priorityUpgradeProbeEpochKey(sessionId),
+        SessionManager.priorityUpgradeProbeCancelledKey(sessionId),
+        `session:${sessionId}:priority_upgrade_pending`
+      );
+    } catch (error) {
+      logger.debug("SessionManager: Failed to mark priority-upgrade probe cancelled", {
+        error,
+        sessionId,
+      });
+    }
+  }
+
+  static async isPriorityUpgradeProbeCancelled(sessionId: string): Promise<boolean> {
+    const redis = getRedisClient();
+    if (!redis || redis.status !== "ready") return false;
+    try {
+      const v = await redis.get(SessionManager.priorityUpgradeProbeCancelledKey(sessionId));
+      return v === "1";
+    } catch {
+      return false;
+    }
+  }
+
+  static async clearPriorityUpgradeProbeCancelled(sessionId: string): Promise<void> {
+    const redis = getRedisClient();
+    if (!redis || redis.status !== "ready") return;
+    try {
+      await redis.del(SessionManager.priorityUpgradeProbeCancelledKey(sessionId));
+    } catch {
+      // ignore
+    }
+  }
+
+  static async getPriorityUpgradeProbeEpoch(sessionId: string): Promise<number> {
+    const redis = getRedisClient();
+    if (!redis || redis.status !== "ready") return 0;
+    try {
+      const raw = await redis.get(SessionManager.priorityUpgradeProbeEpochKey(sessionId));
+      if (!raw) return 0;
+      const epoch = Number.parseInt(raw, 10);
+      return Number.isFinite(epoch) ? epoch : 0;
+    } catch {
+      return 0;
     }
   }
 
@@ -761,7 +902,11 @@ export class SessionManager {
 
     try {
       // ========== 情况 1：首次尝试成功 ==========
-      if (isFirstAttempt) {
+      // forceUpdate / failover must bypass SET NX even when this request itself
+      // succeeded on its first upstream attempt. Priority-upgrade rebinds are
+      // exactly this shape: the session already has a sticky binding, so SET NX
+      // would silently keep the old provider.
+      if (isFirstAttempt && !forceUpdate && !isFailoverSuccess) {
         const key = `session:${sessionId}:provider`;
         // 使用 SET NX 绑定（避免覆盖并发请求）
         const result = await redis.set(
@@ -815,6 +960,8 @@ export class SessionManager {
           pipeline.setex(`session:${sessionId}:key`, SessionManager.SESSION_TTL, keyId.toString());
         }
         await pipeline.exec();
+        // 强制换绑后无条件从 0 开始；无需为比较旧值多读一次 Redis。
+        await SessionManager.resetStickyFirstByteTimeoutStreak(sessionId);
 
         const reason = isFailoverSuccess ? "failover_success" : "race_winner_forced";
         logger.info(
@@ -901,6 +1048,9 @@ export class SessionManager {
           pipeline.setex(`session:${sessionId}:key`, SessionManager.SESSION_TTL, keyId.toString());
         }
         await pipeline.exec();
+        if (currentProviderId !== newProviderId) {
+          await SessionManager.resetStickyFirstByteTimeoutStreak(sessionId);
+        }
 
         logger.info("SessionManager: Updated binding (current provider not found)", {
           sessionId,
@@ -932,6 +1082,9 @@ export class SessionManager {
           pipeline.setex(`session:${sessionId}:key`, SessionManager.SESSION_TTL, keyId.toString());
         }
         await pipeline.exec();
+        if (currentProviderId !== newProviderId) {
+          await SessionManager.resetStickyFirstByteTimeoutStreak(sessionId);
+        }
 
         logger.info("SessionManager: Migrated to higher priority provider", {
           sessionId,
@@ -965,6 +1118,9 @@ export class SessionManager {
           pipeline.setex(`session:${sessionId}:key`, SessionManager.SESSION_TTL, keyId.toString());
         }
         await pipeline.exec();
+        if (currentProviderId !== newProviderId) {
+          await SessionManager.resetStickyFirstByteTimeoutStreak(sessionId);
+        }
 
         logger.info("SessionManager: Migrated to backup provider (circuit open)", {
           sessionId,

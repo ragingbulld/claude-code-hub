@@ -34,7 +34,10 @@ export function inferPhase(chain: ProviderChainItem[]): string {
       return "retrying";
     case "hedge_triggered":
     case "hedge_launched":
+    case "hedge_batch_launched":
+    case "hedge_timeout_grace":
       return "hedge_racing";
+    case "hedge_timeout_excluded":
     case "hedge_winner":
     case "hedge_loser_cancelled":
     case "hedge_loser_billed":

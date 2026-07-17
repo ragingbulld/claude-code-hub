@@ -151,6 +151,23 @@ export class ProxySession {
   // 上次选择的决策上下文（用于记录到 providerChain）
   private _lastSelectionContext?: ProviderChainItem["decisionContext"];
 
+  /**
+   * Priority-upgrade probe plan for this request:
+   * - stickyProvider: current session binding (lower priority / often more expensive)
+   * - higherPriorityProviders: ordered candidates to cheap-test by priority tier,
+   *   or the single target of a pending rebind
+   * - mode: cheap_test_only | apply_pending_rebind
+   */
+  private _priorityUpgradePlan?: {
+    mode: "cheap_test_only" | "apply_pending_rebind";
+    stickyProviderId: number;
+    higherPriorityProviderId: number;
+    higherPriorityProviderIds: number[];
+    probeEpoch: number;
+    stickyPriority: number;
+    higherPriority: number;
+  };
+
   // Cache TTL override (resolved)
   private cacheTtlResolved: CacheTtlResolved | null = null;
 
@@ -608,6 +625,11 @@ export class ProxySession {
         | "client_restriction_filtered" // 供应商因客户端限制被跳过（会话复用路径）
         | "hedge_triggered" // Hedge 计时器触发，启动备选供应商
         | "hedge_launched" // Hedge 备选供应商已启动（信息性记录）
+        | "hedge_batch_launched" // 冷启动/无粘性时同档批量竞速启动
+        | "hedge_timeout_excluded" // 首字超时直接排除（按输家处理）
+        | "hedge_timeout_grace" // sticky 绑定源第一次连续首字超时：软宽限，可反超
+        | "priority_upgrade_probe" // 旁路 cheap 测试更高优先级供应商
+        | "priority_upgrade_rebind" // 应用 pending：改绑到更高优先级
         | "hedge_winner" // 该供应商赢得 Hedge 竞速（最先收到首字节）
         | "hedge_loser_cancelled" // 该供应商输掉 Hedge 竞速，请求被取消（未计费）
         | "hedge_loser_billed" // 该供应商输掉 Hedge 竞速，但其响应被后台拿回并计费
@@ -616,6 +638,7 @@ export class ProxySession {
         | "session_reuse"
         | "weighted_random"
         | "group_filtered"
+        | "priority_upgrade"
         | "fail_open_fallback";
       circuitState?: "closed" | "open" | "half-open";
       attemptNumber?: number;
@@ -666,16 +689,45 @@ export class ProxySession {
       rawCrossProviderFallbackEnabled: metadata?.rawCrossProviderFallbackEnabled,
     };
 
-    // 避免重复添加同一个供应商
-    // 检查最后一条记录是否与当前记录完全相同（id + reason + attemptNumber）
-    const lastItem = this.providerChain[this.providerChain.length - 1];
-    const shouldAdd =
-      this.providerChain.length === 0 ||
-      lastItem.id !== provider.id ||
-      lastItem.reason !== metadata?.reason ||
-      (metadata?.attemptNumber !== undefined && lastItem.attemptNumber !== metadata.attemptNumber);
+    // Success terminal records are idempotent across the full chain. Streaming hedge code
+    // records a success at first-byte commit, then deferred finalization may try to record
+    // it again after informational probe events were appended. Treat request_success,
+    // retry_success, and hedge_winner as the same terminal outcome for one attempt.
+    const successReasons = new Set<ProviderChainItem["reason"]>([
+      "request_success",
+      "retry_success",
+      "hedge_winner",
+    ]);
+    const isDuplicateSuccessfulAttempt =
+      successReasons.has(item.reason) &&
+      item.attemptNumber !== undefined &&
+      this.providerChain.some(
+        (existing) =>
+          existing.id === item.id &&
+          existing.attemptNumber === item.attemptNumber &&
+          existing.statusCode === item.statusCode &&
+          successReasons.has(existing.reason)
+      );
 
-    if (shouldAdd) {
+    // Preserve the existing adjacent-event dedup for non-terminal records.
+    const lastItem = this.providerChain[this.providerChain.length - 1];
+    // A priority-upgrade probe intentionally records multiple phases with the same
+    // provider/reason pair (start -> pass/fail/discard). Only identical phases are
+    // duplicates; otherwise a single-candidate tier would lose its terminal event
+    // and the dashboard would spin forever.
+    const isDistinctPriorityUpgradeProbePhase =
+      metadata?.reason === "priority_upgrade_probe" &&
+      lastItem?.reason === "priority_upgrade_probe" &&
+      lastItem.errorMessage !== metadata.errorMessage;
+    const isDuplicateAdjacentEvent =
+      this.providerChain.length > 0 &&
+      lastItem.id === provider.id &&
+      lastItem.reason === metadata?.reason &&
+      (metadata?.attemptNumber === undefined ||
+        lastItem.attemptNumber === metadata.attemptNumber) &&
+      !isDistinctPriorityUpgradeProbePhase;
+
+    if (!isDuplicateSuccessfulAttempt && !isDuplicateAdjacentEvent) {
       this.providerChain.push(item);
       this.persistLiveChain();
     }
@@ -906,6 +958,36 @@ export class ProxySession {
    */
   getLastSelectionContext(): ProviderChainItem["decisionContext"] | undefined {
     return this._lastSelectionContext;
+  }
+
+  setPriorityUpgradePlan(
+    plan:
+      | {
+          mode: "cheap_test_only" | "apply_pending_rebind";
+          stickyProviderId: number;
+          higherPriorityProviderId: number;
+          higherPriorityProviderIds: number[];
+          probeEpoch: number;
+          stickyPriority: number;
+          higherPriority: number;
+        }
+      | undefined
+  ): void {
+    this._priorityUpgradePlan = plan;
+  }
+
+  getPriorityUpgradePlan():
+    | {
+        mode: "cheap_test_only" | "apply_pending_rebind";
+        stickyProviderId: number;
+        higherPriorityProviderId: number;
+        higherPriorityProviderIds: number[];
+        probeEpoch: number;
+        stickyPriority: number;
+        higherPriority: number;
+      }
+    | undefined {
+    return this._priorityUpgradePlan;
   }
 
   /**

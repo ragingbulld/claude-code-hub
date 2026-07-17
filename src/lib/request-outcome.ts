@@ -28,6 +28,12 @@ const NEUTRAL_REASONS = new Set<NonNullable<ProviderChainItem["reason"]>>([
   "initial_selection",
   "hedge_triggered",
   "hedge_launched",
+  "hedge_batch_launched",
+  "hedge_timeout_excluded",
+  "hedge_timeout_grace",
+  "priority_upgrade_probe",
+
+  "priority_upgrade_rebind",
   "client_restriction_filtered",
   "http2_fallback",
 ]);

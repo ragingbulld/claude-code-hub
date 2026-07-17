@@ -189,6 +189,41 @@ function resolveVersionlessOpenAiFallbackUrl(
   return getVersionlessOpenAiFallbackUrl(requestUrl);
 }
 
+async function readResponseBodyWithFirstByte(
+  response: Response,
+  attemptStartTime: number,
+  onFirstByte: (elapsedMs: number) => void
+): Promise<string> {
+  if (!response.body) {
+    onFirstByte(Date.now() - attemptStartTime);
+    return response.text();
+  }
+
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let totalLength = 0;
+  let first = true;
+
+  while (true) {
+    const chunk = await reader.read();
+    if (first) {
+      first = false;
+      onFirstByte(Date.now() - attemptStartTime);
+    }
+    if (chunk.done) break;
+    chunks.push(chunk.value);
+    totalLength += chunk.value.byteLength;
+  }
+
+  const merged = new Uint8Array(totalLength);
+  let offset = 0;
+  for (const chunk of chunks) {
+    merged.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder().decode(merged);
+}
+
 async function runSingleAttempt(
   config: ProviderTestConfig,
   plan: AttemptPlan,
@@ -239,10 +274,25 @@ async function runSingleAttempt(
       while (true) {
         attemptStartTime = Date.now();
         firstByteMs = undefined;
-        const response = await fetch(requestUrl, fetchOptions);
-        firstByteMs = Date.now() - attemptStartTime;
-
-        const responseBody = await response.text();
+        const firstByteTimeoutId =
+          config.firstByteTimeoutMs && config.firstByteTimeoutMs > 0
+            ? setTimeout(() => controller.abort(), config.firstByteTimeoutMs)
+            : null;
+        let response: Response;
+        let responseBody: string;
+        try {
+          response = await fetch(requestUrl, fetchOptions);
+          responseBody = await readResponseBodyWithFirstByte(
+            response,
+            attemptStartTime,
+            (elapsedMs) => {
+              firstByteMs = elapsedMs;
+              if (firstByteTimeoutId) clearTimeout(firstByteTimeoutId);
+            }
+          );
+        } finally {
+          if (firstByteTimeoutId) clearTimeout(firstByteTimeoutId);
+        }
         const fallbackUrl = resolveVersionlessOpenAiFallbackUrl(
           config,
           requestUrl,

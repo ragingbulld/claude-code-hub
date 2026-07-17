@@ -22,6 +22,23 @@
     "sessionReuse": "會話複用 → {provider} ✓",
     "originHint": "會話複用 - 最初通過 {method} 選擇"
   },
+  "priorityUpgrade": {
+    "testTriggered": "此請求觸發了優先級升級測試",
+    "openDetails": "查看優先級升級測試詳情",
+    "title": "優先級升級測試",
+    "subtitle": "旁路檢測更優供應商的可用性",
+    "candidates": "{count} 個候選",
+    "firstByte": "首字節 {ms}ms",
+    "testingHint": "測試進行中，結果會隨日誌重新整理自動更新",
+    "finishedHint": "通過的供應商將在下一次請求中嘗試升級",
+    "status": {
+      "testing": "正在測試",
+      "passed": "測試通過 · 等待升級",
+      "passedNotSelected": "測試通過 · 同批較慢",
+      "failed": "測試未通過",
+      "discarded": "路由已變更 · 結果作廢"
+    }
+  },
   "description": {
     "noDecisionRecord": "無決策記錄",
     "sessionReuse": "會話複用選擇供應商",

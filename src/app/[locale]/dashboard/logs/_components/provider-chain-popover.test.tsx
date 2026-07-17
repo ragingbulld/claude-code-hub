@@ -46,8 +46,12 @@ vi.mock("@/components/ui/popover", () => {
     return <div data-slot="popover-trigger">{children}</div>;
   }
 
-  function PopoverContent({ children }: PropsWithChildren) {
-    return <div data-slot="popover-content">{children}</div>;
+  function PopoverContent({ children, ...props }: React.ComponentProps<"div"> & PropsWithChildren) {
+    return (
+      <div data-slot="popover-content" {...props}>
+        {children}
+      </div>
+    );
   }
 
   return { Popover, PopoverTrigger, PopoverContent };
@@ -73,7 +77,7 @@ vi.mock("@/components/ui/badge", () => ({
   ),
 }));
 
-import { ProviderChainPopover } from "./provider-chain-popover";
+import { buildPriorityUpgradeProbeRecords, ProviderChainPopover } from "./provider-chain-popover";
 
 const messages = {
   dashboard: {
@@ -228,6 +232,153 @@ describe("provider-chain-popover probability formatting", () => {
 
     // Should not show any percentage
     expect(html).not.toMatch(/\d+%\)/);
+  });
+});
+
+describe("provider-chain-popover priority-upgrade test marker", () => {
+  test("renders an icon-only marker for a single successful request that triggered a probe", () => {
+    const html = renderWithIntl(
+      <ProviderChainPopover
+        chain={[
+          { id: 1, name: "sticky", reason: "session_reuse" },
+          { id: 1, name: "sticky", reason: "request_success", statusCode: 200 },
+          {
+            id: 2,
+            name: "higher-priority",
+            reason: "priority_upgrade_probe",
+            errorMessage: "cheap_test_start",
+            priority: 2,
+            costMultiplier: 0.01,
+          },
+        ]}
+        finalProvider="sticky"
+      />
+    );
+
+    const document = parseHtml(html);
+    const marker = document.querySelector('[data-priority-upgrade-test="true"]');
+    expect(marker).not.toBeNull();
+    expect(marker?.textContent).toBe("");
+    expect(marker?.querySelector(".animate-spin")).not.toBeNull();
+    expect(marker?.getAttribute("title")).toBe("This request triggered a priority-upgrade test");
+    const details = document.querySelector('[data-priority-upgrade-probe-details="true"]');
+    expect(details?.textContent).toContain("Priority upgrade test");
+    expect(details?.textContent).toContain("higher-priority");
+    expect(details?.textContent).toContain("Testing");
+    expect(details?.textContent).toContain("P2");
+    expect(details?.textContent).toContain("x0.01");
+  });
+
+  test("renders a completed failure without a spinner and shows first-byte latency", () => {
+    const html = renderWithIntl(
+      <ProviderChainPopover
+        chain={[
+          { id: 1, name: "sticky", reason: "session_reuse" },
+          { id: 1, name: "sticky", reason: "request_success", statusCode: 200 },
+          {
+            id: 2,
+            name: "candidate",
+            reason: "priority_upgrade_probe",
+            errorMessage: "cheap_test_start",
+            priority: 2,
+            costMultiplier: 0.01,
+          },
+          {
+            id: 2,
+            name: "candidate",
+            reason: "priority_upgrade_probe",
+            errorMessage: "cheap_test_fail_status=red_first_byte_ms=824",
+            priority: 2,
+            costMultiplier: 0.01,
+          },
+        ]}
+        finalProvider="sticky"
+      />
+    );
+
+    const document = parseHtml(html);
+    const marker = document.querySelector('[data-priority-upgrade-test="true"]');
+    expect(marker?.querySelector(".animate-spin")).toBeNull();
+    const details = document.querySelector('[data-priority-upgrade-probe-details="true"]');
+    expect(details?.textContent).toContain("Test failed");
+    expect(details?.textContent).toContain("First byte 824ms");
+  });
+
+  test("groups raw start and terminal events into one status per provider", () => {
+    const records = buildPriorityUpgradeProbeRecords([
+      { id: 2, name: "winner", reason: "priority_upgrade_probe", errorMessage: "cheap_test_start" },
+      { id: 3, name: "slower", reason: "priority_upgrade_probe", errorMessage: "cheap_test_start" },
+      {
+        id: 4,
+        name: "errored",
+        reason: "priority_upgrade_probe",
+        errorMessage: "cheap_test_start",
+      },
+      {
+        id: 3,
+        name: "slower",
+        reason: "priority_upgrade_probe",
+        errorMessage: "cheap_test_ok_not_selected_first_byte_ms=900",
+      },
+      {
+        id: 4,
+        name: "errored",
+        reason: "priority_upgrade_probe",
+        errorMessage: "cheap_test_error",
+      },
+      {
+        id: 2,
+        name: "winner",
+        reason: "priority_upgrade_probe",
+        errorMessage: "cheap_test_ok_pending_rebind_first_byte_ms=500",
+      },
+    ]);
+
+    expect(
+      records.map((record) => [record.provider.id, record.status, record.firstByteMs])
+    ).toEqual([
+      [2, "passed", 500],
+      [3, "passedNotSelected", 900],
+      [4, "failed", undefined],
+    ]);
+  });
+
+  test("does not render the marker when the request did not trigger a probe", () => {
+    const html = renderWithIntl(
+      <ProviderChainPopover
+        chain={[
+          { id: 1, name: "sticky", reason: "session_reuse" },
+          { id: 1, name: "sticky", reason: "request_success", statusCode: 200 },
+        ]}
+        finalProvider="sticky"
+      />
+    );
+
+    const document = parseHtml(html);
+    expect(document.querySelector('[data-priority-upgrade-test="true"]')).toBeNull();
+  });
+
+  test("also renders the icon-only marker in retry or hedge popover triggers", () => {
+    const html = renderWithIntl(
+      <ProviderChainPopover
+        chain={[
+          { id: 1, name: "first", reason: "retry_failed", statusCode: 500 },
+          { id: 2, name: "winner", reason: "retry_success", statusCode: 200 },
+          {
+            id: 3,
+            name: "higher-priority",
+            reason: "priority_upgrade_probe",
+            errorMessage: "cheap_test_start",
+          },
+        ]}
+        finalProvider="winner"
+      />
+    );
+
+    const document = parseHtml(html);
+    const marker = document.querySelector('[data-priority-upgrade-test="true"]');
+    expect(marker).not.toBeNull();
+    expect(marker?.textContent).toBe("");
   });
 });
 

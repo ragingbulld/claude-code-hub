@@ -56,6 +56,42 @@ describe("executeProviderTest", () => {
 
   afterEach(() => {
     vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
+
+  test("first-byte SLA met should not require the full response body to finish within that SLA", async () => {
+    vi.useFakeTimers();
+    const encoder = new TextEncoder();
+    fetchMock.mockResolvedValue(
+      new Response(
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(encoder.encode('{"choices":[{"message":{"content":"'));
+            setTimeout(() => {
+              controller.enqueue(encoder.encode('pong"}}]}'));
+              controller.close();
+            }, 40);
+          },
+        }),
+        { status: 200, headers: { "content-type": "application/json" } }
+      )
+    );
+
+    const resultPromise = executeProviderTest({
+      providerUrl: "https://api.example.com",
+      apiKey: "test-key",
+      providerType: "openai-compatible",
+      model: "gpt-test",
+      firstByteTimeoutMs: 20,
+      timeoutMs: 100,
+      latencyThresholdMs: 20,
+    });
+
+    await vi.advanceTimersByTimeAsync(50);
+    const result = await resultPromise;
+    expect(result.success).toBe(true);
+    expect(result.firstByteMs).toBeLessThanOrEqual(20);
+    expect(result.latencyMs).toBeGreaterThanOrEqual(40);
   });
 
   test("openai-compatible 应该把聊天内容解析为纯文本预览，而不是直接回显整段 JSON", async () => {
@@ -169,33 +205,33 @@ describe("executeProviderTest", () => {
     expectRequestUrl("https://relay.example.com/openai/v1/responses");
   });
 
-  test.each([
-    "https://api.gptclubapi.xyz/openai",
-    "https://api.gptclubapi.xyz/openai/",
-  ])("codex bare /openai base preserves absolute versioned request url: %s", async (providerUrl) => {
-    mockJsonResponse({
-      id: "resp_test",
-      model: "gpt-5.5",
-      output: [
-        {
-          type: "message",
-          role: "assistant",
-          content: [{ type: "output_text", text: "pong" }],
-        },
-      ],
-    });
+  test.each(["https://api.gptclubapi.xyz/openai", "https://api.gptclubapi.xyz/openai/"])(
+    "codex bare /openai base preserves absolute versioned request url: %s",
+    async (providerUrl) => {
+      mockJsonResponse({
+        id: "resp_test",
+        model: "gpt-5.5",
+        output: [
+          {
+            type: "message",
+            role: "assistant",
+            content: [{ type: "output_text", text: "pong" }],
+          },
+        ],
+      });
 
-    const result = await executeProviderTest({
-      providerUrl,
-      apiKey: "sk-test-codex",
-      providerType: "codex",
-      model: "gpt-5.5",
-    });
+      const result = await executeProviderTest({
+        providerUrl,
+        apiKey: "sk-test-codex",
+        providerType: "codex",
+        model: "gpt-5.5",
+      });
 
-    expect(result.success).toBe(true);
-    expect(result.requestUrl).toBe("https://api.gptclubapi.xyz/openai/v1/responses");
-    expect(fetchMock.mock.calls[0]?.[0]).toBe("https://api.gptclubapi.xyz/openai/v1/responses");
-  });
+      expect(result.success).toBe(true);
+      expect(result.requestUrl).toBe("https://api.gptclubapi.xyz/openai/v1/responses");
+      expect(fetchMock.mock.calls[0]?.[0]).toBe("https://api.gptclubapi.xyz/openai/v1/responses");
+    }
+  );
 
   test("openai-compatible 版本根路径应只追加 endpoint，不重复拼接 /v1", async () => {
     mockJsonResponse({

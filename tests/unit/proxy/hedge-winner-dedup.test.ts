@@ -160,8 +160,8 @@ function createSession(): ProxySession {
   });
 }
 
-describe("addProviderToChain dedup behavior with hedge reasons", () => {
-  it("same provider with hedge_winner then retry_success produces duplicate (documents bug)", () => {
+describe("addProviderToChain successful-attempt dedup", () => {
+  it("treats hedge_winner and retry_success as one successful attempt", () => {
     const session = createSession();
     const provider = makeProvider(1, "Provider A");
 
@@ -174,7 +174,7 @@ describe("addProviderToChain dedup behavior with hedge reasons", () => {
       endpointUrl: "https://api.example.com",
     });
 
-    // finalization would log with retry_success (the bug)
+    // Deferred finalization tries to log the same terminal success again.
     session.addProviderToChain(provider, {
       reason: "retry_success",
       attemptNumber: 1,
@@ -184,12 +184,38 @@ describe("addProviderToChain dedup behavior with hedge reasons", () => {
     });
 
     const chain = session.getProviderChain();
-    // Documents the current (broken) behavior: 2 entries for the same provider.
-    // After the fix, finalization won't call addProviderToChain for hedge winners,
-    // so this scenario won't arise in practice.
-    expect(chain).toHaveLength(2);
+    expect(chain).toHaveLength(1);
     expect(chain[0].reason).toBe("hedge_winner");
-    expect(chain[1].reason).toBe("retry_success");
+  });
+
+  it("deduplicates a streaming success even when priority probe events were appended between phases", () => {
+    const session = createSession();
+    const winner = makeProvider(1, "Winner");
+    const probe = makeProvider(2, "Probe");
+
+    // First-byte commit records the user request success.
+    session.addProviderToChain(winner, {
+      reason: "request_success",
+      attemptNumber: 1,
+      statusCode: 200,
+      endpointId: 10,
+      endpointUrl: "https://api.example.com",
+    });
+    // Side-path probe completes before the user stream finalizer.
+    session.addProviderToChain(probe, { reason: "priority_upgrade_probe" });
+    // Stream finalization must not append a second 200 for attempt 1.
+    session.addProviderToChain(winner, {
+      reason: "request_success",
+      attemptNumber: 1,
+      statusCode: 200,
+      endpointId: 10,
+      endpointUrl: "https://api.example.com",
+    });
+
+    const chain = session.getProviderChain();
+    expect(chain).toHaveLength(2);
+    expect(chain.map((item) => item.reason)).toEqual(["request_success", "priority_upgrade_probe"]);
+    expect(chain.filter((item) => item.statusCode === 200)).toHaveLength(1);
   });
 
   it("same provider with identical reason and attemptNumber deduplicates correctly", () => {

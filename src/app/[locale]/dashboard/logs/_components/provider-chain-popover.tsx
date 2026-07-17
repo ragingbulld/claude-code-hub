@@ -4,9 +4,11 @@ import {
   AlertTriangle,
   CheckCircle,
   ChevronRight,
+  FlaskConical,
   GitBranch,
   InfoIcon,
   Link2,
+  Loader2,
   MinusCircle,
   RefreshCw,
   XCircle,
@@ -36,6 +38,214 @@ interface ProviderChainPopoverProps {
   hasCostBadge?: boolean;
   /** Callback when a chain item is clicked in the popover */
   onChainItemClick?: (chainIndex: number) => void;
+}
+
+type ProbeStatus = "testing" | "passed" | "passedNotSelected" | "failed" | "discarded";
+
+interface ProbeRecord {
+  provider: ProviderChainItem;
+  status: ProbeStatus;
+  firstByteMs?: number;
+}
+
+function parseFirstByteMs(message?: string): number | undefined {
+  const matched = message?.match(/first_byte_ms=(\d+)/);
+  return matched ? Number(matched[1]) : undefined;
+}
+
+export function buildPriorityUpgradeProbeRecords(chain: ProviderChainItem[]): ProbeRecord[] {
+  const records = new Map<number, ProbeRecord>();
+  for (const item of chain) {
+    if (item.reason !== "priority_upgrade_probe") continue;
+    const message = item.errorMessage ?? "";
+    if (message === "cheap_test_start") {
+      records.set(item.id, { provider: item, status: "testing" });
+      continue;
+    }
+    const current = records.get(item.id) ?? { provider: item, status: "testing" as const };
+    if (message.startsWith("cheap_test_ok_pending_rebind")) {
+      records.set(item.id, {
+        ...current,
+        provider: item,
+        status: "passed",
+        firstByteMs: parseFirstByteMs(message),
+      });
+    } else if (message.startsWith("cheap_test_ok_not_selected")) {
+      records.set(item.id, {
+        ...current,
+        provider: item,
+        status: "passedNotSelected",
+        firstByteMs: parseFirstByteMs(message),
+      });
+    } else if (message.startsWith("cheap_test_fail_status=") || message === "cheap_test_error") {
+      records.set(item.id, {
+        ...current,
+        provider: item,
+        status: "failed",
+        firstByteMs: parseFirstByteMs(message),
+      });
+    } else if (message === "cheap_test_discarded_hedge_race") {
+      records.set(item.id, { ...current, provider: item, status: "discarded" });
+    }
+  }
+  return [...records.values()];
+}
+
+function PriorityUpgradeProbePopover({ chain }: { chain: ProviderChainItem[] }) {
+  const tChain = useTranslations("provider-chain");
+  const records = buildPriorityUpgradeProbeRecords(chain);
+  if (records.length === 0) return null;
+
+  const isTesting = records.some((record) => record.status === "testing");
+
+  return (
+    <Popover>
+      <PopoverTrigger asChild>
+        <Button
+          type="button"
+          variant="ghost"
+          size="icon"
+          data-priority-upgrade-test="true"
+          title={tChain("priorityUpgrade.testTriggered")}
+          aria-label={tChain("priorityUpgrade.openDetails")}
+          className="h-5 w-5 shrink-0 rounded-full p-0 text-violet-500 hover:bg-violet-100 hover:text-violet-700 dark:hover:bg-violet-950/60"
+        >
+          {isTesting ? (
+            <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" />
+          ) : (
+            <FlaskConical className="h-3.5 w-3.5" aria-hidden="true" />
+          )}
+        </Button>
+      </PopoverTrigger>
+      <PopoverContent
+        data-priority-upgrade-probe-details="true"
+        className="w-[360px] max-w-[calc(100vw-2rem)] overflow-hidden p-0"
+        align="start"
+      >
+        <div className="flex items-center justify-between border-b bg-gradient-to-r from-violet-50/80 to-transparent px-4 py-3 dark:from-violet-950/30">
+          <div className="flex items-center gap-2">
+            <div className="flex h-7 w-7 items-center justify-center rounded-full bg-violet-100 text-violet-600 dark:bg-violet-950/70 dark:text-violet-300">
+              {isTesting ? (
+                <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />
+              ) : (
+                <FlaskConical className="h-4 w-4" aria-hidden="true" />
+              )}
+            </div>
+            <div>
+              <h4 className="text-sm font-semibold">{tChain("priorityUpgrade.title")}</h4>
+              <p className="text-[10px] text-muted-foreground">
+                {tChain("priorityUpgrade.subtitle")}
+              </p>
+            </div>
+          </div>
+          <Badge variant="outline" className="text-[10px]">
+            {tChain("priorityUpgrade.candidates", { count: records.length })}
+          </Badge>
+        </div>
+
+        <div className="max-h-[300px] overflow-y-auto px-4 py-3">
+          {records.map((record, index) => {
+            const isLast = index === records.length - 1;
+            const statusStyle =
+              record.status === "testing"
+                ? {
+                    icon: Loader2,
+                    color: "text-blue-600",
+                    bg: "bg-blue-50 dark:bg-blue-950/30",
+                    spin: true,
+                  }
+                : record.status === "passed"
+                  ? {
+                      icon: CheckCircle,
+                      color: "text-emerald-600",
+                      bg: "bg-emerald-50 dark:bg-emerald-950/30",
+                      spin: false,
+                    }
+                  : record.status === "passedNotSelected"
+                    ? {
+                        icon: CheckCircle,
+                        color: "text-teal-600",
+                        bg: "bg-teal-50 dark:bg-teal-950/30",
+                        spin: false,
+                      }
+                    : record.status === "discarded"
+                      ? {
+                          icon: MinusCircle,
+                          color: "text-slate-500",
+                          bg: "bg-slate-50 dark:bg-slate-800/50",
+                          spin: false,
+                        }
+                      : {
+                          icon: XCircle,
+                          color: "text-rose-600",
+                          bg: "bg-rose-50 dark:bg-rose-950/30",
+                          spin: false,
+                        };
+            const StatusIcon = statusStyle.icon;
+
+            return (
+              <div key={record.provider.id} className="relative flex gap-3">
+                <div className="flex flex-col items-center">
+                  <div
+                    className={cn(
+                      "flex h-7 w-7 shrink-0 items-center justify-center rounded-full border",
+                      statusStyle.bg
+                    )}
+                  >
+                    <StatusIcon
+                      className={cn(
+                        "h-3.5 w-3.5",
+                        statusStyle.color,
+                        statusStyle.spin && "animate-spin"
+                      )}
+                    />
+                  </div>
+                  {!isLast && <div className="min-h-[12px] w-0.5 flex-1 bg-border" />}
+                </div>
+                <div className={cn("min-w-0 flex-1 pb-4", isLast && "pb-0")}>
+                  <div className="flex min-w-0 items-center gap-1.5">
+                    <span className="truncate text-xs font-medium" dir="auto">
+                      {record.provider.name}
+                    </span>
+                    {record.provider.priority !== undefined && (
+                      <Badge
+                        variant="outline"
+                        className="shrink-0 px-1 py-0 text-[9px] text-violet-600"
+                      >
+                        P{record.provider.priority}
+                      </Badge>
+                    )}
+                    {record.provider.costMultiplier !== undefined && (
+                      <Badge
+                        variant="outline"
+                        className="shrink-0 border-green-200 bg-green-50 px-1 py-0 text-[9px] text-green-700 dark:border-green-800 dark:bg-green-950/30 dark:text-green-300"
+                      >
+                        x{record.provider.costMultiplier.toFixed(2)}
+                      </Badge>
+                    )}
+                  </div>
+                  <div className="mt-1 flex items-center gap-2 text-[10px]">
+                    <span className={statusStyle.color}>
+                      {tChain(`priorityUpgrade.status.${record.status}`)}
+                    </span>
+                    {record.firstByteMs !== undefined && (
+                      <span className="text-muted-foreground">
+                        {tChain("priorityUpgrade.firstByte", { ms: record.firstByteMs })}
+                      </span>
+                    )}
+                  </div>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+
+        <div className="border-t bg-muted/30 px-4 py-2.5 text-center text-[10px] text-muted-foreground">
+          {tChain(isTesting ? "priorityUpgrade.testingHint" : "priorityUpgrade.finishedHint")}
+        </div>
+      </PopoverContent>
+    </Popover>
+  );
 }
 
 function parseGroupTags(groupTag?: string | null): string[] {
@@ -147,6 +357,7 @@ export function ProviderChainPopover({
   const requestCount = chain.filter(isActualRequest).length;
   const retryCount = getRetryCount(chain);
   const isHedge = isHedgeRace(chain);
+  const hasPriorityUpgradeProbe = chain.some((item) => item.reason === "priority_upgrade_probe");
 
   // Fallback for empty string
   const displayName = finalProvider || "-";
@@ -186,6 +397,7 @@ export function ProviderChainPopover({
                   </span>
                 )}
                 <span className="truncate">{displayName}</span>
+                {hasPriorityUpgradeProbe && <PriorityUpgradeProbePopover chain={chain} />}
               </span>
             </TooltipTrigger>
             <TooltipContent side="bottom" align="start" className="max-w-[320px]">
@@ -409,204 +621,209 @@ export function ProviderChainPopover({
     finalCostMultiplier !== 1;
 
   return (
-    <Popover>
-      <PopoverTrigger asChild>
-        <Button
-          type="button"
-          variant="ghost"
-          className="h-auto p-0 font-normal hover:bg-transparent w-full min-w-0"
-          aria-label={`${displayName} - ${isHedge ? tChain("timeline.hedgeRace") : `${requestCount}${t("logs.table.times")}`}`}
-        >
-          <span className="flex w-full items-center gap-1 min-w-0">
-            {/* Request count badge */}
-            {isHedge ? (
-              <GitBranch className="h-3 w-3 shrink-0 text-indigo-500" />
-            ) : (
-              <Badge variant="secondary" className="shrink-0">
-                {requestCount}
-                {t("logs.table.times")}
-              </Badge>
-            )}
-            {/* Provider name */}
-            <span className="truncate min-w-0" dir="auto">
-              {displayName}
+    <div className="flex w-full min-w-0 items-center gap-1">
+      <Popover>
+        <PopoverTrigger asChild>
+          <Button
+            type="button"
+            variant="ghost"
+            className="h-auto w-full flex-1 min-w-0 p-0 font-normal hover:bg-transparent"
+            aria-label={`${displayName} - ${isHedge ? tChain("timeline.hedgeRace") : `${requestCount}${t("logs.table.times")}`}`}
+          >
+            <span className="flex w-full items-center gap-1 min-w-0">
+              {/* Request count badge */}
+              {isHedge ? (
+                <GitBranch className="h-3 w-3 shrink-0 text-indigo-500" />
+              ) : (
+                <Badge variant="secondary" className="shrink-0">
+                  {requestCount}
+                  {t("logs.table.times")}
+                </Badge>
+              )}
+              {/* Provider name */}
+              <span className="truncate min-w-0" dir="auto">
+                {displayName}
+              </span>
+              {/* Cost multiplier badge (if not 1) */}
+              {hasFinalCostBadge && (
+                <Badge
+                  variant="outline"
+                  className={cn(
+                    "text-[10px] px-1 py-0 shrink-0",
+                    finalCostMultiplier > 1
+                      ? "bg-orange-50 text-orange-700 border-orange-200 dark:bg-orange-950/30 dark:text-orange-300 dark:border-orange-800"
+                      : "bg-green-50 text-green-700 border-green-200 dark:bg-green-950/30 dark:text-green-300 dark:border-green-800"
+                  )}
+                >
+                  x{finalCostMultiplier.toFixed(2)}
+                </Badge>
+              )}
+              {/* Group tag badges (if present) */}
+              {finalGroupTags.map((group) => (
+                <TooltipProvider key={group}>
+                  <Tooltip delayDuration={200}>
+                    <TooltipTrigger asChild>
+                      <Badge
+                        variant="outline"
+                        className="text-[10px] px-1 py-0 shrink-0 bg-slate-50 text-slate-600 border-slate-200 dark:bg-slate-900/30 dark:text-slate-400 dark:border-slate-700 max-w-[120px] truncate"
+                      >
+                        {group}
+                      </Badge>
+                    </TooltipTrigger>
+                    <TooltipContent>{group}</TooltipContent>
+                  </Tooltip>
+                </TooltipProvider>
+              ))}
+              {/* Info icon */}
+              <InfoIcon className="h-3 w-3 text-muted-foreground shrink-0" aria-hidden="true" />
             </span>
-            {/* Cost multiplier badge (if not 1) */}
-            {hasFinalCostBadge && (
-              <Badge
-                variant="outline"
-                className={cn(
-                  "text-[10px] px-1 py-0 shrink-0",
-                  finalCostMultiplier > 1
-                    ? "bg-orange-50 text-orange-700 border-orange-200 dark:bg-orange-950/30 dark:text-orange-300 dark:border-orange-800"
-                    : "bg-green-50 text-green-700 border-green-200 dark:bg-green-950/30 dark:text-green-300 dark:border-green-800"
-                )}
-              >
-                x{finalCostMultiplier.toFixed(2)}
+          </Button>
+        </PopoverTrigger>
+
+        <PopoverContent className="w-[360px] max-w-[calc(100vw-2rem)] p-0" align="start">
+          <div className="p-3 border-b">
+            <div className="flex items-center justify-between">
+              <h4 className="font-semibold text-sm">{t("logs.providerChain.decisionChain")}</h4>
+              <Badge variant="outline" className="text-[10px]">
+                {isHedge
+                  ? tChain("timeline.hedgeRace")
+                  : `${requestCount} ${t("logs.table.times")}`}
               </Badge>
-            )}
-            {/* Group tag badges (if present) */}
-            {finalGroupTags.map((group) => (
-              <TooltipProvider key={group}>
-                <Tooltip delayDuration={200}>
-                  <TooltipTrigger asChild>
-                    <Badge
-                      variant="outline"
-                      className="text-[10px] px-1 py-0 shrink-0 bg-slate-50 text-slate-600 border-slate-200 dark:bg-slate-900/30 dark:text-slate-400 dark:border-slate-700 max-w-[120px] truncate"
-                    >
-                      {group}
-                    </Badge>
-                  </TooltipTrigger>
-                  <TooltipContent>{group}</TooltipContent>
-                </Tooltip>
-              </TooltipProvider>
-            ))}
-            {/* Info icon */}
-            <InfoIcon className="h-3 w-3 text-muted-foreground shrink-0" aria-hidden="true" />
-          </span>
-        </Button>
-      </PopoverTrigger>
-
-      <PopoverContent className="w-[360px] max-w-[calc(100vw-2rem)] p-0" align="start">
-        <div className="p-3 border-b">
-          <div className="flex items-center justify-between">
-            <h4 className="font-semibold text-sm">{t("logs.providerChain.decisionChain")}</h4>
-            <Badge variant="outline" className="text-[10px]">
-              {isHedge ? tChain("timeline.hedgeRace") : `${requestCount} ${t("logs.table.times")}`}
-            </Badge>
+            </div>
           </div>
-        </div>
 
-        {/* Visual chain */}
-        <div className="p-3 space-y-0 max-h-[300px] overflow-y-auto">
-          {actualRequests.map((item, index) => {
-            const status = getItemStatus(item);
-            const Icon = status.icon;
-            const isLast = index === actualRequests.length - 1;
+          {/* Visual chain */}
+          <div className="p-3 space-y-0 max-h-[300px] overflow-y-auto">
+            {actualRequests.map((item, index) => {
+              const status = getItemStatus(item);
+              const Icon = status.icon;
+              const isLast = index === actualRequests.length - 1;
 
-            return (
-              <div
-                key={`${item.id}-${index}`}
-                className={cn(
-                  "relative flex gap-2",
-                  onChainItemClick &&
-                    "cursor-pointer hover:bg-muted/50 rounded-md p-1 -m-1 transition-colors"
-                )}
-                onClick={
-                  onChainItemClick
-                    ? () => {
-                        // Map actualRequests index back to original chain index
-                        const originalIndex = chain.indexOf(item);
-                        onChainItemClick(originalIndex);
-                      }
-                    : undefined
-                }
-                onKeyDown={
-                  onChainItemClick
-                    ? (e) => {
-                        if (e.key === "Enter" || e.key === " ") {
-                          e.preventDefault();
+              return (
+                <div
+                  key={`${item.id}-${index}`}
+                  className={cn(
+                    "relative flex gap-2",
+                    onChainItemClick &&
+                      "cursor-pointer hover:bg-muted/50 rounded-md p-1 -m-1 transition-colors"
+                  )}
+                  onClick={
+                    onChainItemClick
+                      ? () => {
+                          // Map actualRequests index back to original chain index
                           const originalIndex = chain.indexOf(item);
                           onChainItemClick(originalIndex);
                         }
-                      }
-                    : undefined
-                }
-                role={onChainItemClick ? "button" : undefined}
-                tabIndex={onChainItemClick ? 0 : undefined}
-              >
-                {/* Timeline connector */}
-                <div className="flex flex-col items-center">
-                  <div
-                    className={cn(
-                      "flex h-6 w-6 shrink-0 items-center justify-center rounded-full border",
-                      status.bgColor
-                    )}
-                  >
-                    <Icon className={cn("h-3 w-3", status.color)} />
+                      : undefined
+                  }
+                  onKeyDown={
+                    onChainItemClick
+                      ? (e) => {
+                          if (e.key === "Enter" || e.key === " ") {
+                            e.preventDefault();
+                            const originalIndex = chain.indexOf(item);
+                            onChainItemClick(originalIndex);
+                          }
+                        }
+                      : undefined
+                  }
+                  role={onChainItemClick ? "button" : undefined}
+                  tabIndex={onChainItemClick ? 0 : undefined}
+                >
+                  {/* Timeline connector */}
+                  <div className="flex flex-col items-center">
+                    <div
+                      className={cn(
+                        "flex h-6 w-6 shrink-0 items-center justify-center rounded-full border",
+                        status.bgColor
+                      )}
+                    >
+                      <Icon className={cn("h-3 w-3", status.color)} />
+                    </div>
+                    {!isLast && <div className="w-0.5 flex-1 min-h-[8px] bg-border" />}
                   </div>
-                  {!isLast && <div className="w-0.5 flex-1 min-h-[8px] bg-border" />}
-                </div>
 
-                {/* Content */}
-                <div className={cn("flex-1 pb-3", isLast && "pb-0")}>
-                  <div className="flex items-center gap-2">
-                    <span className="text-xs font-medium">{item.name}</span>
-                    {item.statusCode && (
-                      <Badge
-                        variant="outline"
-                        className={cn(
-                          "text-[10px] px-1 py-0",
-                          item.statusCode >= 200 && item.statusCode < 300
-                            ? "border-emerald-500 text-emerald-600"
-                            : "border-rose-500 text-rose-600"
-                        )}
-                      >
-                        {item.statusCode}
-                      </Badge>
-                    )}
-                    {item.statusCode && item.statusCodeInferred && (
-                      <Badge
-                        variant="outline"
-                        className="text-[10px] px-1 py-0 border-amber-500 text-amber-700 dark:text-amber-300"
-                        title={t("logs.details.statusCodeInferredTooltip")}
-                      >
-                        {t("logs.details.statusCodeInferredBadge")}
-                      </Badge>
-                    )}
-                    {item.reason && !item.statusCode && (
-                      <span className="text-[10px] text-muted-foreground">
-                        {tChain(`reasons.${item.reason}`)}
-                      </span>
+                  {/* Content */}
+                  <div className={cn("flex-1 pb-3", isLast && "pb-0")}>
+                    <div className="flex items-center gap-2">
+                      <span className="text-xs font-medium">{item.name}</span>
+                      {item.statusCode && (
+                        <Badge
+                          variant="outline"
+                          className={cn(
+                            "text-[10px] px-1 py-0",
+                            item.statusCode >= 200 && item.statusCode < 300
+                              ? "border-emerald-500 text-emerald-600"
+                              : "border-rose-500 text-rose-600"
+                          )}
+                        >
+                          {item.statusCode}
+                        </Badge>
+                      )}
+                      {item.statusCode && item.statusCodeInferred && (
+                        <Badge
+                          variant="outline"
+                          className="text-[10px] px-1 py-0 border-amber-500 text-amber-700 dark:text-amber-300"
+                          title={t("logs.details.statusCodeInferredTooltip")}
+                        >
+                          {t("logs.details.statusCodeInferredBadge")}
+                        </Badge>
+                      )}
+                      {item.reason && !item.statusCode && (
+                        <span className="text-[10px] text-muted-foreground">
+                          {tChain(`reasons.${item.reason}`)}
+                        </span>
+                      )}
+                    </div>
+                    {item.errorMessage && (
+                      <>
+                        <p className="text-[10px] text-muted-foreground mt-0.5 line-clamp-1">
+                          {item.errorMessage}
+                        </p>
+                        {typeof item.errorMessage === "string" &&
+                          item.errorMessage.startsWith("FAKE_200_") && (
+                            <p className="text-[10px] text-amber-700 dark:text-amber-300 mt-0.5 line-clamp-2">
+                              {t("logs.details.fake200DetectedReason", {
+                                reason: t(
+                                  getFake200ReasonKey(
+                                    item.errorMessage.split(": ")[0],
+                                    "logs.details.fake200Reasons"
+                                  )
+                                ),
+                              })}
+                            </p>
+                          )}
+                      </>
                     )}
                   </div>
-                  {item.errorMessage && (
-                    <>
-                      <p className="text-[10px] text-muted-foreground mt-0.5 line-clamp-1">
-                        {item.errorMessage}
-                      </p>
-                      {typeof item.errorMessage === "string" &&
-                        item.errorMessage.startsWith("FAKE_200_") && (
-                          <p className="text-[10px] text-amber-700 dark:text-amber-300 mt-0.5 line-clamp-2">
-                            {t("logs.details.fake200DetectedReason", {
-                              reason: t(
-                                getFake200ReasonKey(
-                                  item.errorMessage.split(": ")[0],
-                                  "logs.details.fake200Reasons"
-                                )
-                              ),
-                            })}
-                          </p>
-                        )}
-                    </>
-                  )}
+                </div>
+              );
+            })}
+          </div>
+
+          <div className="p-2 border-t bg-muted/30">
+            {hasFake200PostStreamFailure && (
+              <div className="flex items-start justify-center gap-1.5 text-[10px] text-amber-700 dark:text-amber-300 px-2 pb-1">
+                <InfoIcon className="h-3 w-3 shrink-0 mt-0.5" aria-hidden="true" />
+                <div className="flex flex-col items-center gap-1 text-center">
+                  <span>{t("logs.details.fake200ForwardedNotice")}</span>
+                  <Fake200RetryTooltip
+                    className="justify-center text-amber-700 dark:text-amber-300"
+                    side="top"
+                    align="center"
+                  />
                 </div>
               </div>
-            );
-          })}
-        </div>
-
-        <div className="p-2 border-t bg-muted/30">
-          {hasFake200PostStreamFailure && (
-            <div className="flex items-start justify-center gap-1.5 text-[10px] text-amber-700 dark:text-amber-300 px-2 pb-1">
-              <InfoIcon className="h-3 w-3 shrink-0 mt-0.5" aria-hidden="true" />
-              <div className="flex flex-col items-center gap-1 text-center">
-                <span>{t("logs.details.fake200ForwardedNotice")}</span>
-                <Fake200RetryTooltip
-                  className="justify-center text-amber-700 dark:text-amber-300"
-                  side="top"
-                  align="center"
-                />
-              </div>
-            </div>
-          )}
-          <p className="text-[10px] text-muted-foreground text-center">
-            {onChainItemClick
-              ? t("logs.providerChain.clickItemForDetails")
-              : t("logs.details.clickStatusCode")}
-          </p>
-        </div>
-      </PopoverContent>
-    </Popover>
+            )}
+            <p className="text-[10px] text-muted-foreground text-center">
+              {onChainItemClick
+                ? t("logs.providerChain.clickItemForDetails")
+                : t("logs.details.clickStatusCode")}
+            </p>
+          </div>
+        </PopoverContent>
+      </Popover>
+      {hasPriorityUpgradeProbe && <PriorityUpgradeProbePopover chain={chain} />}
+    </div>
   );
 }

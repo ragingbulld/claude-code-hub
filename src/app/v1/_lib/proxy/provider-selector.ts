@@ -2,6 +2,10 @@ import { matchesAllowedModelRules } from "@/lib/allowed-model-rules";
 import { getCircuitState, isCircuitOpen } from "@/lib/circuit-breaker";
 import { PROVIDER_GROUP } from "@/lib/constants/provider.constants";
 import { logger } from "@/lib/logger";
+import {
+  consumePendingPriorityRebind,
+  isPriorityUpgradeProbeEnabled,
+} from "@/lib/priority-upgrade-probe";
 import { RateLimitService } from "@/lib/rate-limit";
 import { SessionManager } from "@/lib/session-manager";
 import { parseProviderGroups, resolveProviderGroupsWithDefault } from "@/lib/utils/provider-group";
@@ -144,36 +148,92 @@ export class ProxyProviderResolver {
     // === 会话复用 ===
     const reusedProvider = await ProxyProviderResolver.findReusable(session);
     if (reusedProvider) {
-      session.setProvider(reusedProvider);
+      // Priority-upgrade: cheap-test higher priority; if it already passed, rebind
+      // next request as single-send (no parallel race with sticky).
+      const upgrade = await ProxyProviderResolver.planPriorityUpgrade(session, reusedProvider);
+      if (upgrade?.mode === "apply_pending_rebind") {
+        session.setProvider(upgrade.higher);
+        session.setPriorityUpgradePlan({
+          mode: "apply_pending_rebind",
+          stickyProviderId: reusedProvider.id,
+          higherPriorityProviderId: upgrade.higher.id,
+          higherPriorityProviderIds: [upgrade.higher.id],
+          probeEpoch: 0,
+          stickyPriority: reusedProvider.priority || 0,
+          higherPriority: upgrade.higher.priority || 0,
+        });
+        session.addProviderToChain(upgrade.higher, {
+          reason: "priority_upgrade_rebind",
+          selectionMethod: "priority_upgrade",
+          circuitState: getCircuitState(upgrade.higher.id),
+          decisionContext: {
+            totalProviders: 0,
+            enabledProviders: 0,
+            targetType: upgrade.higher.providerType as NonNullable<
+              ProviderChainItem["decisionContext"]
+            >["targetType"],
+            requestedModel: session.getOriginalModel() || "",
+            groupFilterApplied: false,
+            beforeHealthCheck: 0,
+            afterHealthCheck: 0,
+            priorityLevels: [upgrade.higher.priority || 0],
+            selectedPriority: upgrade.higher.priority || 0,
+            candidatesAtPriority: [
+              {
+                id: upgrade.higher.id,
+                name: upgrade.higher.name,
+                weight: upgrade.higher.weight,
+                costMultiplier: upgrade.higher.costMultiplier,
+              },
+            ],
+            sessionId: session.sessionId || undefined,
+          },
+        });
+      } else {
+        session.setProvider(reusedProvider);
+        if (upgrade) {
+          session.setPriorityUpgradePlan({
+            mode: upgrade.mode,
+            stickyProviderId: reusedProvider.id,
+            higherPriorityProviderId: upgrade.higher.id,
+            higherPriorityProviderIds: upgrade.candidates.map((provider) => provider.id),
+            probeEpoch: upgrade.probeEpoch,
+            stickyPriority: reusedProvider.priority || 0,
+            higherPriority: upgrade.higher.priority || 0,
+          });
+        } else {
+          session.setPriorityUpgradePlan(undefined);
+        }
 
-      // 记录会话复用上下文
-      session.addProviderToChain(reusedProvider, {
-        reason: "session_reuse",
-        selectionMethod: "session_reuse",
-        circuitState: getCircuitState(reusedProvider.id),
-        decisionContext: {
-          totalProviders: 0, // 复用不需要筛选
-          enabledProviders: 0,
-          targetType: reusedProvider.providerType as NonNullable<
-            ProviderChainItem["decisionContext"]
-          >["targetType"],
-          requestedModel: session.getOriginalModel() || "",
-          groupFilterApplied: false,
-          beforeHealthCheck: 0,
-          afterHealthCheck: 0,
-          priorityLevels: [reusedProvider.priority || 0],
-          selectedPriority: reusedProvider.priority || 0,
-          candidatesAtPriority: [
-            {
-              id: reusedProvider.id,
-              name: reusedProvider.name,
-              weight: reusedProvider.weight,
-              costMultiplier: reusedProvider.costMultiplier,
-            },
-          ],
-          sessionId: session.sessionId || undefined,
-        },
-      });
+        // 记录会话复用上下文
+        session.addProviderToChain(reusedProvider, {
+          reason: "session_reuse",
+          selectionMethod: "session_reuse",
+          circuitState: getCircuitState(reusedProvider.id),
+          decisionContext: {
+            totalProviders: 0, // 复用不需要筛选
+            enabledProviders: 0,
+            targetType: reusedProvider.providerType as NonNullable<
+              ProviderChainItem["decisionContext"]
+            >["targetType"],
+            requestedModel: session.getOriginalModel() || "",
+            groupFilterApplied: false,
+            beforeHealthCheck: 0,
+            afterHealthCheck: 0,
+            priorityLevels: [reusedProvider.priority || 0],
+            selectedPriority: reusedProvider.priority || 0,
+            candidatesAtPriority: [
+              {
+                id: reusedProvider.id,
+                name: reusedProvider.name,
+                weight: reusedProvider.weight,
+                costMultiplier: reusedProvider.costMultiplier,
+              },
+            ],
+            sessionId: session.sessionId || undefined,
+          },
+        });
+      }
     }
 
     // === 首次选择或重试 ===
@@ -711,6 +771,165 @@ export class ProxyProviderResolver {
       sessionId: session.sessionId,
     });
     return provider;
+  }
+
+  /**
+   * Plan a priority-upgrade action when sticky is on a lower-priority provider.
+   *
+   * Modes:
+   * - apply_pending_rebind: previous cheap-test passed → switch to higher priority now (single-send)
+   * - cheap_test_only: need a cheap test first; keep sticky as primary this turn
+   */
+  private static async planPriorityUpgrade(
+    session: ProxySession,
+    sticky: Provider
+  ): Promise<{
+    mode: "cheap_test_only" | "apply_pending_rebind";
+    higher: Provider;
+    candidates: Provider[];
+    probeEpoch: number;
+  } | null> {
+    if (!isPriorityUpgradeProbeEnabled()) return null;
+    if (!session.sessionId) return null;
+    // Only meaningful when first-byte timeout path exists (same SLA budget as hedge).
+    if ((sticky.firstByteTimeoutStreamingMs ?? 0) <= 0) return null;
+
+    const requestedModel = session.getOriginalModel() || "";
+    const systemTimezone = await resolveSystemTimezone();
+    const allProviders = await session.getProvidersSnapshot();
+    const effectiveGroup = getEffectiveProviderGroup(session);
+    const stickyPriority = ProxyProviderResolver.resolveEffectivePriority(sticky, effectiveGroup);
+
+    const passesRequestPolicy = (provider: Provider): boolean => {
+      if (!provider.isEnabled || provider.id === sticky.id || provider.disableSessionReuse) {
+        return false;
+      }
+      if (
+        ProxyProviderResolver.resolveEffectivePriority(provider, effectiveGroup) >= stickyPriority
+      ) {
+        return false;
+      }
+      if (requestedModel && !providerSupportsModel(provider, requestedModel)) return false;
+      if (
+        session.originalFormat &&
+        !checkFormatProviderTypeCompatibility(session.originalFormat, provider.providerType)
+      ) {
+        return false;
+      }
+      if (!isProviderActiveNow(provider.activeTimeStart, provider.activeTimeEnd, systemTimezone)) {
+        return false;
+      }
+      if (effectiveGroup && !checkProviderGroupMatch(provider.groupTag, effectiveGroup))
+        return false;
+      return isClientAllowedDetailed(
+        session,
+        provider.allowedClients ?? [],
+        provider.blockedClients ?? []
+      ).allowed;
+    };
+
+    // 1) Atomically consume a pending rebind from a previous successful cheap test.
+    // Only one concurrent request may apply it.
+    const pendingId = await consumePendingPriorityRebind(session.sessionId);
+    if (pendingId != null && pendingId !== sticky.id) {
+      const pending = allProviders.find((p) => p.id === pendingId) ?? null;
+      if (
+        pending &&
+        passesRequestPolicy(pending) &&
+        (await ProxyProviderResolver.filterByLimits([pending])).length === 1
+      ) {
+        return {
+          mode: "apply_pending_rebind",
+          higher: pending,
+          candidates: [pending],
+          probeEpoch: 0,
+        };
+      }
+      // Stale pending was already consumed atomically.
+    }
+
+    // 2) Collect higher-priority candidates for this model/format/group.
+    const higherCandidates = await ProxyProviderResolver.filterByLimits(
+      allProviders.filter(passesRequestPolicy)
+    );
+
+    if (higherCandidates.length === 0) return null;
+
+    // Walk priority tiers from highest (lowest number) down toward sticky.
+    // Goal: recover the cheapest eligible provider that can meet first-byte SLA.
+    const priorities = [
+      ...new Set(
+        higherCandidates.map((p) =>
+          ProxyProviderResolver.resolveEffectivePriority(p, effectiveGroup)
+        )
+      ),
+    ].sort((a, b) => a - b);
+
+    const candidatesToProbe = priorities.flatMap((priority) =>
+      higherCandidates.filter(
+        (p) => ProxyProviderResolver.resolveEffectivePriority(p, effectiveGroup) === priority
+      )
+    );
+
+    // Every probe round receives the complete ordered set of eligible providers.
+    // There is deliberately no provider-level success marker or failure cooldown.
+
+    // Clear only the short-lived flag before this request starts. The monotonic
+    // epoch is never reset, so a concurrent/new hedge race cannot be erased.
+    await SessionManager.clearPriorityUpgradeProbeCancelled(session.sessionId);
+    const probeEpoch = await SessionManager.getPriorityUpgradeProbeEpoch(session.sessionId);
+
+    return {
+      mode: "cheap_test_only",
+      higher: candidatesToProbe[0],
+      candidates: candidatesToProbe,
+      probeEpoch,
+    };
+  }
+
+  /**
+   * Return all remaining candidates at the best (lowest) priority tier that are
+   * still eligible for hedge launch. Used by cold-start batch and timeout cascade
+   * so each batch is "whole top remaining priority", then next lower priority.
+   */
+  static async selectPriorityTierCandidates(
+    session: ProxySession,
+    excludeIds: number[] = []
+  ): Promise<Provider[]> {
+    const { provider: _ignored, context } = await ProxyProviderResolver.pickRandomProvider(
+      session,
+      excludeIds
+    );
+    // pickRandomProvider already selected top priority among remaining; reuse its
+    // candidatesAtPriority ids, then resolve full Provider objects from snapshot.
+    const candidateIds = (context.candidatesAtPriority ?? [])
+      .map((c) => Number(c.id))
+      .filter((id) => Number.isFinite(id) && id > 0 && !excludeIds.includes(id));
+
+    if (candidateIds.length === 0) {
+      // Fallback: if context empty but a provider was selected, return that one.
+      if (_ignored && !excludeIds.includes(_ignored.id)) return [_ignored];
+      return [];
+    }
+
+    const all = await session.getProvidersSnapshot();
+    const byId = new Map(all.map((p) => [p.id, p]));
+    const out: Provider[] = [];
+    for (const id of candidateIds) {
+      const p = byId.get(id);
+      if (!p?.isEnabled) continue;
+      if (excludeIds.includes(p.id)) continue;
+      out.push(p);
+    }
+
+    // Ensure pickRandomProvider's chosen one is first if present.
+    if (_ignored) {
+      const rest = out.filter((p) => p.id !== _ignored.id);
+      if (out.some((p) => p.id === _ignored.id)) {
+        return [_ignored, ...rest];
+      }
+    }
+    return out;
   }
 
   private static async pickRandomProvider(
