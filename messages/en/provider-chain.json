@@ -29,6 +29,7 @@
     "subtitle": "Lightweight availability probe for better providers",
     "candidates": "{count} candidates",
     "firstByte": "First byte {ms}ms",
+    "streak": "Successful probes {current}/{required}",
     "testingHint": "Testing is in progress; results update with the log",
     "finishedHint": "Passed providers will be tried on the next request",
     "status": {

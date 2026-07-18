@@ -29,6 +29,7 @@
     "subtitle": "より優先度の高いプロバイダーの軽量可用性テスト",
     "candidates": "候補 {count} 件",
     "firstByte": "初回応答 {ms}ms",
+    "streak": "連続成功 {current}/{required}",
     "testingHint": "テスト中です。結果はログ更新時に反映されます",
     "finishedHint": "合格したプロバイダーは次のリクエストで試されます",
     "status": {

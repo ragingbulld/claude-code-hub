@@ -290,7 +290,7 @@ describe("provider-chain-popover priority-upgrade test marker", () => {
             id: 2,
             name: "candidate",
             reason: "priority_upgrade_probe",
-            errorMessage: "cheap_test_fail_status=red_first_byte_ms=824",
+            errorMessage: "cheap_test_fail_status=red_first_byte_ms=824_streak=0/3",
             priority: 2,
             costMultiplier: 0.01,
           },
@@ -306,7 +306,51 @@ describe("provider-chain-popover priority-upgrade test marker", () => {
     expect(marker?.querySelector(".animate-spin")).toBeNull();
     const details = document.querySelector('[data-priority-upgrade-probe-details="true"]');
     expect(details?.textContent).toContain("Test failed");
+    expect(details?.textContent).toContain("Successful probes 0/3");
+    expect(details?.querySelector('[data-probe-streak="0/3"]')).not.toBeNull();
     expect(details?.textContent).toContain("First byte 824ms");
+  });
+
+  test("shows independent 1/3 and 2/3 success counts for candidates in the same batch", () => {
+    const html = renderWithIntl(
+      <ProviderChainPopover
+        chain={[
+          {
+            id: 2,
+            name: "candidate-one",
+            reason: "priority_upgrade_probe",
+            errorMessage: "cheap_test_start",
+          },
+          {
+            id: 3,
+            name: "candidate-two",
+            reason: "priority_upgrade_probe",
+            errorMessage: "cheap_test_start",
+          },
+          {
+            id: 2,
+            name: "candidate-one",
+            reason: "priority_upgrade_probe",
+            errorMessage:
+              "cheap_test_ok_not_selected_streak=1/3_first_byte_ms=620_average_first_byte_ms=620",
+          },
+          {
+            id: 3,
+            name: "candidate-two",
+            reason: "priority_upgrade_probe",
+            errorMessage:
+              "cheap_test_ok_not_selected_streak=2/3_first_byte_ms=540_average_first_byte_ms=560",
+          },
+        ]}
+        finalProvider="sticky"
+      />
+    );
+
+    const details = parseHtml(html).querySelector('[data-priority-upgrade-probe-details="true"]');
+    expect(details?.textContent).toContain("Successful probes 1/3");
+    expect(details?.textContent).toContain("Successful probes 2/3");
+    expect(details?.querySelector('[data-probe-streak="1/3"]')).not.toBeNull();
+    expect(details?.querySelector('[data-probe-streak="2/3"]')).not.toBeNull();
   });
 
   test("uses cyan for a completed winning probe", () => {
@@ -333,10 +377,14 @@ describe("provider-chain-popover priority-upgrade test marker", () => {
       />
     );
 
-    const marker = parseHtml(html).querySelector('[data-priority-upgrade-test="true"]');
+    const document = parseHtml(html);
+    const marker = document.querySelector('[data-priority-upgrade-test="true"]');
     expect(marker?.getAttribute("data-probe-status")).toBe("passed");
     expect(marker?.classList.contains("text-cyan-500")).toBe(true);
     expect(marker?.querySelector(".animate-spin")).toBeNull();
+    const details = document.querySelector('[data-priority-upgrade-probe-details="true"]');
+    expect(details?.textContent).toContain("Successful probes 3/3");
+    expect(details?.querySelector('[data-probe-streak="3/3"]')).not.toBeNull();
   });
 
   test("groups raw start and terminal events into one status per provider", () => {
@@ -360,7 +408,7 @@ describe("provider-chain-popover priority-upgrade test marker", () => {
         id: 4,
         name: "errored",
         reason: "priority_upgrade_probe",
-        errorMessage: "cheap_test_error",
+        errorMessage: "cheap_test_error_streak=0/3",
       },
       {
         id: 2,
@@ -372,11 +420,17 @@ describe("provider-chain-popover priority-upgrade test marker", () => {
     ]);
 
     expect(
-      records.map((record) => [record.provider.id, record.status, record.firstByteMs])
+      records.map((record) => [
+        record.provider.id,
+        record.status,
+        record.firstByteMs,
+        record.consecutiveSuccesses,
+        record.requiredSuccesses,
+      ])
     ).toEqual([
-      [2, "passed", 500],
-      [3, "passedNotSelected", 900],
-      [4, "failed", undefined],
+      [2, "passed", 500, 3, 3],
+      [3, "passedNotSelected", 900, 2, 3],
+      [4, "failed", undefined, 0, 3],
     ]);
   });
 

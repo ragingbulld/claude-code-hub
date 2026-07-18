@@ -46,11 +46,30 @@ interface ProbeRecord {
   provider: ProviderChainItem;
   status: ProbeStatus;
   firstByteMs?: number;
+  consecutiveSuccesses?: number;
+  requiredSuccesses?: number;
 }
 
 function parseFirstByteMs(message?: string): number | undefined {
   const matched = message?.match(/first_byte_ms=(\d+)/);
   return matched ? Number(matched[1]) : undefined;
+}
+
+function parseProbeStreak(
+  message?: string
+): { consecutiveSuccesses: number; requiredSuccesses: number } | undefined {
+  const matched = message?.match(/(?:^|_)streak=(\d+)\/(\d+)(?:_|$)/);
+  if (matched) {
+    return {
+      consecutiveSuccesses: Number(matched[1]),
+      requiredSuccesses: Number(matched[2]),
+    };
+  }
+  // Backward compatibility for probe records written before the explicit 0/3 payload.
+  if (message?.includes("streak_reset=1")) {
+    return { consecutiveSuccesses: 0, requiredSuccesses: 3 };
+  }
+  return undefined;
 }
 
 export function buildPriorityUpgradeProbeRecords(chain: ProviderChainItem[]): ProbeRecord[] {
@@ -63,9 +82,11 @@ export function buildPriorityUpgradeProbeRecords(chain: ProviderChainItem[]): Pr
       continue;
     }
     const current = records.get(item.id) ?? { provider: item, status: "testing" as const };
+    const streak = parseProbeStreak(message);
     if (message.startsWith("cheap_test_ok_pending_rebind")) {
       records.set(item.id, {
         ...current,
+        ...streak,
         provider: item,
         status: "passed",
         firstByteMs: parseFirstByteMs(message),
@@ -73,13 +94,18 @@ export function buildPriorityUpgradeProbeRecords(chain: ProviderChainItem[]): Pr
     } else if (message.startsWith("cheap_test_ok_not_selected")) {
       records.set(item.id, {
         ...current,
+        ...streak,
         provider: item,
         status: "passedNotSelected",
         firstByteMs: parseFirstByteMs(message),
       });
-    } else if (message.startsWith("cheap_test_fail_status=") || message === "cheap_test_error") {
+    } else if (
+      message.startsWith("cheap_test_fail_status=") ||
+      message.startsWith("cheap_test_error")
+    ) {
       records.set(item.id, {
         ...current,
+        ...streak,
         provider: item,
         status: "failed",
         firstByteMs: parseFirstByteMs(message),
@@ -245,10 +271,29 @@ function PriorityUpgradeProbePopover({ chain }: { chain: ProviderChainItem[] }) 
                       </Badge>
                     )}
                   </div>
-                  <div className="mt-1 flex items-center gap-2 text-[10px]">
+                  <div className="mt-1 flex flex-wrap items-center gap-2 text-[10px]">
                     <span className={statusStyle.color}>
                       {tChain(`priorityUpgrade.status.${record.status}`)}
                     </span>
+                    {record.consecutiveSuccesses !== undefined &&
+                      record.requiredSuccesses !== undefined && (
+                        <span
+                          data-probe-streak={`${record.consecutiveSuccesses}/${record.requiredSuccesses}`}
+                          className={cn(
+                            "rounded-full border px-1.5 py-px font-medium tabular-nums",
+                            record.consecutiveSuccesses >= record.requiredSuccesses
+                              ? "border-emerald-200 bg-emerald-50 text-emerald-700 dark:border-emerald-800 dark:bg-emerald-950/30 dark:text-emerald-300"
+                              : record.consecutiveSuccesses === 0
+                                ? "border-rose-200 bg-rose-50 text-rose-700 dark:border-rose-800 dark:bg-rose-950/30 dark:text-rose-300"
+                                : "border-amber-200 bg-amber-50 text-amber-700 dark:border-amber-800 dark:bg-amber-950/30 dark:text-amber-300"
+                          )}
+                        >
+                          {tChain("priorityUpgrade.streak", {
+                            current: record.consecutiveSuccesses,
+                            required: record.requiredSuccesses,
+                          })}
+                        </span>
+                      )}
                     {record.firstByteMs !== undefined && (
                       <span className="text-muted-foreground">
                         {tChain("priorityUpgrade.firstByte", { ms: record.firstByteMs })}

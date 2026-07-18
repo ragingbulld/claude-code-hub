@@ -5359,7 +5359,7 @@ export class ProxyForwarder {
             reason: "priority_upgrade_probe",
             selectionMethod: "priority_upgrade",
             circuitState: getCircuitState(outcome.provider.id),
-            errorMessage: "cheap_test_error_streak_reset=1",
+            errorMessage: `cheap_test_error_streak=0/${PRIORITY_UPGRADE_PROBE.REQUIRED_CONSECUTIVE_SUCCESSES}`,
           });
           logger.debug("ProxyForwarder: priority-upgrade cheap test failed", {
             providerId: outcome.provider.id,
@@ -5374,7 +5374,7 @@ export class ProxyForwarder {
             reason: "priority_upgrade_probe",
             selectionMethod: "priority_upgrade",
             circuitState: getCircuitState(outcome.provider.id),
-            errorMessage: `cheap_test_fail_status=${outcome.result.status}_first_byte_ms=${outcome.result.firstByteMs ?? -1}_streak_reset=1`,
+            errorMessage: `cheap_test_fail_status=${outcome.result.status}_first_byte_ms=${outcome.result.firstByteMs ?? -1}_streak=0/${PRIORITY_UPGRADE_PROBE.REQUIRED_CONSECUTIVE_SUCCESSES}`,
           });
         }
       }

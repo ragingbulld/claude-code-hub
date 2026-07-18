@@ -29,6 +29,7 @@
     "subtitle": "旁路檢測更優供應商的可用性",
     "candidates": "{count} 個候選",
     "firstByte": "首字節 {ms}ms",
+    "streak": "連續成功 {current}/{required}",
     "testingHint": "測試進行中，結果會隨日誌重新整理自動更新",
     "finishedHint": "通過的供應商將在下一次請求中嘗試升級",
     "status": {
